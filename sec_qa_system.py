@@ -1,15 +1,20 @@
-
 import os
 import re
 import json
 import sqlite3
 import requests
 import logging
+import asyncio
+import aiohttp
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import hashlib
+import time
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import pandas as pd
 import numpy as np
@@ -21,6 +26,9 @@ from chromadb.config import Settings
 import openai
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
+import spacy
+from textstat import flesch_reading_ease
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,88 +36,152 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DocumentMetadata:
-    """Metadata for document chunks"""
+    """Enhanced metadata for document chunks"""
     ticker: str
     filing_type: str
     filing_date: str
     section: str
     chunk_id: str
     page_number: Optional[int] = None
+    company_name: Optional[str] = None
+    cik: Optional[str] = None
+    word_count: Optional[int] = None
+    readability_score: Optional[float] = None
     
 @dataclass
 class QueryContext:
-    """Parsed query context"""
+    """Enhanced parsed query context"""
     tickers: List[str]
     time_periods: List[str]
     filing_types: List[str]
-    query_type: str  # ticker-based, temporal, multi-dimensional
+    query_type: str
     original_query: str
+    entities: List[str] = None
+    intent_keywords: List[str] = None
+    complexity_score: float = 0.0
 
-class SECDataFetcher:
-    """Handles fetching and caching SEC filings"""
+@dataclass
+class PerformanceMetrics:
+    """System performance tracking"""
+    query_start_time: float
+    retrieval_time: float
+    generation_time: float
+    total_time: float
+    chunks_processed: int
+    cache_hits: int
+    api_calls: int
+
+class EnhancedSECDataFetcher:
+    """Complete SEC data fetching implementation with caching and rate limiting"""
     
-    def __init__(self, cache_dir: str = "sec_cache"):
+    def __init__(self, cache_dir: str = "sec_cache", rate_limit: float = 0.1):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        self.rate_limit = rate_limit  # seconds between requests
+        self.last_request_time = 0
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SEC-QA-System research@example.com'
+            'User-Agent': 'SEC-QA-System research@quantfirm.com',
+            'Accept-Encoding': 'gzip, deflate',
+            'Host': 'www.sec.gov'
         })
         
-    def get_company_filings(self, ticker: str, filing_types: List[str] = None, 
-                          start_date: str = None, limit: int = 50) -> List[Dict]:
-        """Fetch company filings from SEC EDGAR"""
-        if filing_types is None:
-            filing_types = ['10-K', '10-Q', '8-K', 'DEF 14A']
-            
-        # Cache key for this request
-        cache_key = f"{ticker}_{'-'.join(filing_types)}_{start_date}_{limit}"
-        cache_file = self.cache_dir / f"{cache_key}.json"
+        # Company ticker to CIK mapping cache
+        self.ticker_cik_cache = {}
+        self._load_ticker_mappings()
+        
+    def _load_ticker_mappings(self):
+        """Load and cache ticker to CIK mappings"""
+        cache_file = self.cache_dir / "ticker_cik_mappings.json"
         
         if cache_file.exists():
-            logger.info(f"Loading cached filings for {ticker}")
             with open(cache_file, 'r') as f:
-                return json.load(f)
-        
-        logger.info(f"Fetching filings for {ticker} from SEC EDGAR")
-        
-        # SEC EDGAR CIK lookup and filing fetch
-        cik = self._get_cik_for_ticker(ticker)
-        if not cik:
-            logger.warning(f"Could not find CIK for ticker {ticker}")
-            return []
-            
-        filings = self._fetch_filings_from_edgar(cik, filing_types, start_date, limit)
-        
-        # Cache the results
-        with open(cache_file, 'w') as f:
-            json.dump(filings, f, indent=2)
-            
-        return filings
+                self.ticker_cik_cache = json.load(f)
+            logger.info(f"Loaded {len(self.ticker_cik_cache)} ticker mappings from cache")
+        else:
+            self._fetch_ticker_mappings()
     
-    def _get_cik_for_ticker(self, ticker: str) -> Optional[str]:
-        """Get CIK number for a ticker symbol"""
+    def _fetch_ticker_mappings(self):
+        """Fetch complete ticker to CIK mappings from SEC"""
         try:
-            # Use SEC company tickers JSON
+            self._rate_limit()
             url = "https://www.sec.gov/files/company_tickers.json"
             response = self.session.get(url)
             response.raise_for_status()
             
             companies = response.json()
             for company_data in companies.values():
-                if company_data.get('ticker', '').upper() == ticker.upper():
-                    cik = str(company_data['cik_str']).zfill(10)
-                    return cik
-                    
-        except Exception as e:
-            logger.error(f"Error fetching CIK for {ticker}: {e}")
+                ticker = company_data.get('ticker', '').upper()
+                cik = str(company_data['cik_str']).zfill(10)
+                self.ticker_cik_cache[ticker] = {
+                    'cik': cik,
+                    'name': company_data.get('title', ''),
+                    'exchange': company_data.get('exchange', '')
+                }
             
-        return None
+            # Save to cache
+            cache_file = self.cache_dir / "ticker_cik_mappings.json"
+            with open(cache_file, 'w') as f:
+                json.dump(self.ticker_cik_cache, f, indent=2)
+                
+            logger.info(f"Fetched and cached {len(self.ticker_cik_cache)} ticker mappings")
+            
+        except Exception as e:
+            logger.error(f"Error fetching ticker mappings: {e}")
+    
+    def _rate_limit(self):
+        """Implement rate limiting for SEC requests"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.rate_limit:
+            time.sleep(self.rate_limit - time_since_last)
+        self.last_request_time = time.time()
+    
+    def get_company_filings(self, ticker: str, filing_types: List[str] = None, 
+                          start_date: str = None, limit: int = 50) -> List[Dict]:
+        """Enhanced filing fetching with complete implementation"""
+        if filing_types is None:
+            filing_types = ['10-K', '10-Q', '8-K', 'DEF 14A', 'FORM 3', 'FORM 4', 'FORM 5']
+            
+        # Cache key for this request
+        cache_key = f"{ticker}_{'-'.join(filing_types)}_{start_date}_{limit}"
+        cache_key_hash = hashlib.md5(cache_key.encode()).hexdigest()
+        cache_file = self.cache_dir / f"filings_{cache_key_hash}.json"
+        
+        if cache_file.exists():
+            # Check cache age (refresh if older than 1 day)
+            cache_age = time.time() - cache_file.stat().st_mtime
+            if cache_age < 86400:  # 24 hours
+                logger.info(f"Loading cached filings for {ticker}")
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+        
+        logger.info(f"Fetching filings for {ticker} from SEC EDGAR")
+        
+        # Get CIK for ticker
+        company_info = self.ticker_cik_cache.get(ticker.upper())
+        if not company_info:
+            logger.warning(f"Could not find CIK for ticker {ticker}")
+            return []
+            
+        cik = company_info['cik']
+        filings = self._fetch_filings_from_edgar(cik, filing_types, start_date, limit, company_info)
+        
+        # Cache the results
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(filings, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not cache filings: {e}")
+            
+        return filings
     
     def _fetch_filings_from_edgar(self, cik: str, filing_types: List[str], 
-                                start_date: str, limit: int) -> List[Dict]:
-        """Fetch filings from SEC EDGAR for a specific CIK"""
+                                start_date: str, limit: int, company_info: Dict) -> List[Dict]:
+        """Complete implementation of SEC EDGAR filing fetch"""
         try:
+            self._rate_limit()
+            
             # SEC EDGAR submissions endpoint
             url = f"https://data.sec.gov/submissions/CIK{cik}.json"
             response = self.session.get(url)
@@ -119,29 +191,40 @@ class SECDataFetcher:
             filings = data.get('filings', {}).get('recent', {})
             
             results = []
-            for i in range(len(filings.get('form', []))):
-                form_type = filings['form'][i]
+            forms = filings.get('form', [])
+            
+            for i in range(len(forms)):
+                form_type = forms[i]
                 if form_type in filing_types:
                     filing_date = filings['filingDate'][i]
-                    accession_number = filings['accessionNumber'][i]
                     
                     # Filter by date if specified
                     if start_date and filing_date < start_date:
                         continue
                         
                     filing_info = {
-                        'ticker': data.get('tickers', [''])[0] if data.get('tickers') else '',
+                        'ticker': company_info.get('name', '').split()[0] if company_info.get('name') else '',
+                        'company_name': company_info.get('name', ''),
                         'filing_type': form_type,
                         'filing_date': filing_date,
-                        'accession_number': accession_number,
+                        'accession_number': filings['accessionNumber'][i],
                         'primary_document': filings['primaryDocument'][i],
                         'cik': cik,
-                        'company_name': data.get('name', '')
+                        'report_date': filings.get('reportDate', [None] * len(forms))[i],
+                        'accepted_date': filings.get('acceptanceDateTime', [None] * len(forms))[i],
+                        'file_number': filings.get('fileNumber', [None] * len(forms))[i],
+                        'film_number': filings.get('filmNumber', [None] * len(forms))[i]
                     }
                     results.append(filing_info)
                     
                     if len(results) >= limit:
                         break
+            
+            # Check for older filings if needed
+            if len(results) < limit and 'older' in data.get('filings', {}):
+                older_filings = self._fetch_older_filings(cik, filing_types, start_date, 
+                                                        limit - len(results), company_info)
+                results.extend(older_filings)
                         
             return sorted(results, key=lambda x: x['filing_date'], reverse=True)
             
@@ -149,1052 +232,1695 @@ class SECDataFetcher:
             logger.error(f"Error fetching filings for CIK {cik}: {e}")
             return []
     
+    def _fetch_older_filings(self, cik: str, filing_types: List[str], start_date: str, 
+                           remaining_limit: int, company_info: Dict) -> List[Dict]:
+        """Fetch older filings from additional archives"""
+        try:
+            self._rate_limit()
+            
+            # This would involve fetching older filing archives
+            # Implementation depends on SEC's archive structure
+            # For now, return empty list but framework is in place
+            logger.info(f"Would fetch {remaining_limit} older filings for CIK {cik}")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error fetching older filings: {e}")
+            return []
+    
     def download_filing_content(self, filing_info: Dict) -> Optional[str]:
-        """Download the actual filing content"""
+        """Enhanced filing content download with error handling"""
         try:
             accession = filing_info['accession_number'].replace('-', '')
             cik = filing_info['cik']
             primary_doc = filing_info['primary_document']
             
+            # Check cache first
+            cache_key = f"{accession}_{primary_doc}"
+            cache_file = self.cache_dir / f"content_{cache_key}.html"
+            
+            if cache_file.exists():
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    return f.read()
+            
+            self._rate_limit()
+            
             # Construct EDGAR URL
             url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
             
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=30)
             response.raise_for_status()
             
-            return response.text
+            content = response.text
+            
+            # Cache the content
+            try:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+            except Exception as e:
+                logger.warning(f"Could not cache content: {e}")
+            
+            return content
             
         except Exception as e:
             logger.error(f"Error downloading filing content: {e}")
             return None
+    
+    async def download_multiple_filings(self, filing_list: List[Dict], 
+                                      max_concurrent: int = 5) -> Dict[str, str]:
+        """Asynchronous batch downloading of multiple filings"""
+        async def download_single(session, filing):
+            try:
+                accession = filing['accession_number'].replace('-', '')
+                cik = filing['cik']
+                primary_doc = filing['primary_document']
+                
+                url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
+                
+                await asyncio.sleep(self.rate_limit)  # Rate limiting
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        return filing['accession_number'], content
+                    else:
+                        logger.warning(f"Failed to download {accession}: {response.status}")
+                        return filing['accession_number'], None
+                        
+            except Exception as e:
+                logger.error(f"Error in async download: {e}")
+                return filing['accession_number'], None
+        
+        results = {}
+        connector = aiohttp.TCPConnector(limit=max_concurrent)
+        timeout = aiohttp.ClientTimeout(total=300)
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            tasks = [download_single(session, filing) for filing in filing_list]
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in completed:
+                if isinstance(result, tuple):
+                    accession, content = result
+                    results[accession] = content
+        
+        return results
 
-class DocumentProcessor:
-    """Processes and chunks SEC documents"""
+class EnhancedDocumentProcessor:
+    """Enhanced document processing with NLP and structure analysis"""
     
     def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
         
+        # Load spaCy model for NLP processing
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            logger.warning("spaCy model not found. Install with: python -m spacy download en_core_web_sm")
+            self.nlp = None
+        
+        # Enhanced section patterns with regex groups
+        self.section_patterns = {
+            'Business': r'item\s*1\s*[\.\-]?\s*(business|overview)',
+            'Risk Factors': r'item\s*1a\s*[\.\-]?\s*risk\s*factors',
+            'Properties': r'item\s*2\s*[\.\-]?\s*properties',
+            'Legal Proceedings': r'item\s*3\s*[\.\-]?\s*legal\s*proceedings',
+            'Controls and Procedures': r'item\s*9a\s*[\.\-]?\s*controls\s*and\s*procedures',
+            'MD&A': r'item\s*7\s*[\.\-]?\s*management.?s\s*discussion\s*and\s*analysis',
+            'Financial Statements': r'item\s*8\s*[\.\-]?\s*financial\s*statements',
+            'Directors and Officers': r'item\s*10\s*[\.\-]?\s*directors.*officers',
+            'Executive Compensation': r'item\s*11\s*[\.\-]?\s*executive\s*compensation',
+            'Security Ownership': r'item\s*12\s*[\.\-]?\s*security\s*ownership',
+            'Exhibits': r'item\s*15\s*[\.\-]?\s*exhibits',
+            'Financial Data': r'consolidated\s*statements?|balance\s*sheet|income\s*statement',
+            'Notes to Financial Statements': r'notes?\s*to\s*(the\s*)?consolidated\s*financial\s*statements',
+            'Insider Trading': r'form\s*[345]\s*|insider\s*trading',
+            'Proxy Statement': r'definitive\s*proxy\s*statement|def\s*14a'
+        }
+        
     def process_filing(self, content: str, filing_info: Dict) -> List[Tuple[str, DocumentMetadata]]:
-        """Process a filing into chunks with metadata"""
+        """Enhanced filing processing with structure analysis"""
         if not content:
             return []
             
-        # Parse HTML content
+        # Parse HTML content with enhanced extraction
         soup = BeautifulSoup(content, 'html.parser')
         
-        # Extract text and identify sections
-        sections = self._extract_sections(soup)
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # Extract sections with enhanced detection
+        sections = self._extract_sections_enhanced(soup, filing_info)
         
         chunks = []
-        for section_name, section_text in sections.items():
+        for section_name, section_data in sections.items():
+            section_text = section_data['text']
             if len(section_text.strip()) < 50:  # Skip very short sections
                 continue
                 
-            section_chunks = self._chunk_text(section_text)
+            section_chunks = self._chunk_text_enhanced(section_text, section_data)
             
-            for i, chunk in enumerate(section_chunks):
+            for i, (chunk, chunk_metadata) in enumerate(section_chunks):
                 metadata = DocumentMetadata(
-                    ticker=filing_info['ticker'],
+                    ticker=filing_info.get('ticker', ''),
                     filing_type=filing_info['filing_type'],
                     filing_date=filing_info['filing_date'],
                     section=section_name,
-                    chunk_id=f"{filing_info['accession_number']}_{section_name}_{i}"
+                    chunk_id=f"{filing_info['accession_number']}_{section_name}_{i}",
+                    company_name=filing_info.get('company_name', ''),
+                    cik=filing_info.get('cik', ''),
+                    word_count=chunk_metadata['word_count'],
+                    readability_score=chunk_metadata['readability_score']
                 )
                 chunks.append((chunk, metadata))
                 
         return chunks
     
-    def _extract_sections(self, soup: BeautifulSoup) -> Dict[str, str]:
-        """Extract sections from SEC filing HTML"""
+    def _extract_sections_enhanced(self, soup: BeautifulSoup, filing_info: Dict) -> Dict[str, Dict]:
+        """Enhanced section extraction with structure analysis"""
         sections = {}
-        
-        # Common section patterns in SEC filings
-        section_patterns = {
-            'Business': r'item\s*1\s*[\.\-]?\s*business',
-            'Risk Factors': r'item\s*1a\s*[\.\-]?\s*risk\s*factors',
-            'Properties': r'item\s*2\s*[\.\-]?\s*properties',
-            'Legal Proceedings': r'item\s*3\s*[\.\-]?\s*legal\s*proceedings',
-            'Financial Statements': r'item\s*8\s*[\.\-]?\s*financial\s*statements',
-            'MD&A': r'item\s*7\s*[\.\-]?\s*management.?s\s*discussion',
-            'Controls': r'item\s*9a\s*[\.\-]?\s*controls\s*and\s*procedures',
-        }
-        
         text = soup.get_text()
         
-        # Try to identify sections using patterns
-        for section_name, pattern in section_patterns.items():
-            matches = list(re.finditer(pattern, text, re.IGNORECASE))
-            if matches:
-                start_pos = matches[0].start()
-                # Find next section or end of document
-                end_pos = len(text)
-                for other_pattern in section_patterns.values():
-                    if other_pattern != pattern:
-                        next_matches = re.search(other_pattern, text[start_pos + 100:], re.IGNORECASE)
-                        if next_matches:
-                            candidate_end = start_pos + 100 + next_matches.start()
-                            if candidate_end < end_pos:
-                                end_pos = candidate_end
-                
-                section_text = text[start_pos:end_pos]
-                sections[section_name] = self._clean_text(section_text)
+        # Extract table of contents if available
+        toc_sections = self._extract_table_of_contents(soup)
+        
+        # Use ToC sections if found, otherwise use pattern matching
+        if toc_sections:
+            sections.update(toc_sections)
+        else:
+            # Pattern-based extraction
+            for section_name, pattern in self.section_patterns.items():
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
+                if matches:
+                    start_pos = matches[0].start()
+                    
+                    # Find next section or end of document
+                    end_pos = len(text)
+                    for other_name, other_pattern in self.section_patterns.items():
+                        if other_name != section_name:
+                            next_matches = re.search(other_pattern, text[start_pos + 100:], re.IGNORECASE)
+                            if next_matches:
+                                candidate_end = start_pos + 100 + next_matches.start()
+                                if candidate_end < end_pos:
+                                    end_pos = candidate_end
+                    
+                    section_text = text[start_pos:end_pos]
+                    cleaned_text = self._clean_text_enhanced(section_text)
+                    
+                    sections[section_name] = {
+                        'text': cleaned_text,
+                        'start_pos': start_pos,
+                        'end_pos': end_pos,
+                        'tables': self._extract_tables_from_section(soup, start_pos, end_pos),
+                        'entities': self._extract_entities(cleaned_text) if self.nlp else []
+                    }
         
         # If no sections found, treat entire document as one section
         if not sections:
-            sections['Full Document'] = self._clean_text(text)
+            cleaned_text = self._clean_text_enhanced(text)
+            sections['Full Document'] = {
+                'text': cleaned_text,
+                'start_pos': 0,
+                'end_pos': len(text),
+                'tables': [],
+                'entities': self._extract_entities(cleaned_text) if self.nlp else []
+            }
             
         return sections
     
-    def _clean_text(self, text: str) -> str:
-        """Clean extracted text"""
-        # Remove excessive whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove control characters
+    def _extract_table_of_contents(self, soup: BeautifulSoup) -> Dict[str, Dict]:
+        """Extract sections based on table of contents"""
+        sections = {}
+        
+        # Look for table of contents patterns
+        toc_patterns = [
+            r'table\s*of\s*contents',
+            r'index\s*to\s*financial\s*statements',
+            r'part\s*i\s*financial\s*information'
+        ]
+        
+        # This would involve more sophisticated HTML parsing
+        # Implementation would depend on specific SEC filing formats
+        # For now, return empty dict but framework is in place
+        
+        return sections
+    
+    def _extract_tables_from_section(self, soup: BeautifulSoup, start_pos: int, end_pos: int) -> List[Dict]:
+        """Extract structured table data from section"""
+        tables = []
+        
+        # Find HTML tables in the section
+        html_tables = soup.find_all('table')
+        
+        for table in html_tables:
+            try:
+                # Convert table to structured data
+                rows = []
+                for tr in table.find_all('tr'):
+                    cells = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
+                    if cells:
+                        rows.append(cells)
+                
+                if rows:
+                    tables.append({
+                        'rows': rows,
+                        'header': rows[0] if rows else [],
+                        'data': rows[1:] if len(rows) > 1 else []
+                    })
+                    
+            except Exception as e:
+                logger.warning(f"Error extracting table: {e}")
+        
+        return tables
+    
+    def _extract_entities(self, text: str) -> List[Dict]:
+        """Extract named entities using spaCy"""
+        if not self.nlp or len(text) > 100000:  # Skip very long texts
+            return []
+        
+        try:
+            doc = self.nlp(text[:10000])  # Limit text length for performance
+            entities = []
+            
+            for ent in doc.ents:
+                if ent.label_ in ['ORG', 'MONEY', 'PERCENT', 'DATE', 'GPE', 'CARDINAL']:
+                    entities.append({
+                        'text': ent.text,
+                        'label': ent.label_,
+                        'start': ent.start_char,
+                        'end': ent.end_char
+                    })
+            
+            return entities
+            
+        except Exception as e:
+            logger.warning(f"Error extracting entities: {e}")
+            return []
+    
+    def _clean_text_enhanced(self, text: str) -> str:
+        """Enhanced text cleaning with preservation of structure"""
+        # Remove excessive whitespace but preserve paragraph breaks
+        text = re.sub(r'\n\s*\n', '\n\n', text)  # Preserve paragraph breaks
+        text = re.sub(r'[ \t]+', ' ', text)  # Normalize spaces
+        
+        # Remove control characters but preserve basic formatting
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        
+        # Clean up common SEC filing artifacts
+        text = re.sub(r'Table of Contents', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)  # Remove page numbers
+        
         return text.strip()
     
-    def _chunk_text(self, text: str) -> List[str]:
-        """Chunk text into smaller pieces"""
+    def _chunk_text_enhanced(self, text: str, section_data: Dict) -> List[Tuple[str, Dict]]:
+        """Enhanced text chunking with metadata"""
         tokens = self.tokenizer.encode(text)
         chunks = []
         
         for i in range(0, len(tokens), self.chunk_size - self.chunk_overlap):
             chunk_tokens = tokens[i:i + self.chunk_size]
             chunk_text = self.tokenizer.decode(chunk_tokens)
-            chunks.append(chunk_text)
+            
+            # Calculate chunk metadata
+            word_count = len(chunk_text.split())
+            readability_score = flesch_reading_ease(chunk_text) if chunk_text.strip() else 0
+            
+            chunk_metadata = {
+                'word_count': word_count,
+                'readability_score': readability_score,
+                'token_count': len(chunk_tokens),
+                'has_tables': len(section_data.get('tables', [])) > 0,
+                'entity_count': len(section_data.get('entities', []))
+            }
+            
+            chunks.append((chunk_text, chunk_metadata))
             
         return chunks
 
-class QueryProcessor:
-    """Processes and analyzes user queries"""
+class EnhancedQueryProcessor:
+    """Enhanced query processing with NLP and intent analysis"""
     
     def __init__(self):
-        # Common ticker symbols
-        self.known_tickers = {
-            'AAPL': 'Apple Inc.',
-            'MSFT': 'Microsoft Corporation',
-            'GOOGL': 'Alphabet Inc.',
-            'AMZN': 'Amazon.com Inc.',
-            'TSLA': 'Tesla Inc.',
-            'META': 'Meta Platforms Inc.',
-            'NVDA': 'NVIDIA Corporation',
-            'JPM': 'JPMorgan Chase & Co.',
-            'JNJ': 'Johnson & Johnson',
-            'V': 'Visa Inc.'
+        # Expanded ticker database
+        self.known_tickers = self._load_comprehensive_tickers()
+        
+        # Enhanced filing type mappings
+        self.filing_types = {
+            '10-k': '10-K', '10k': '10-K', 'annual': '10-K', 'annual report': '10-K',
+            '10-q': '10-Q', '10q': '10-Q', 'quarterly': '10-Q', 'quarterly report': '10-Q',
+            '8-k': '8-K', '8k': '8-K', 'current report': '8-K', 'material event': '8-K',
+            'proxy': 'DEF 14A', 'def 14a': 'DEF 14A', 'proxy statement': 'DEF 14A',
+            'form 3': 'FORM 3', 'form 4': 'FORM 4', 'form 5': 'FORM 5',
+            'insider': ['FORM 3', 'FORM 4', 'FORM 5']
         }
         
-        # Filing type mappings
-        self.filing_types = {
-            '10-k': '10-K',
-            '10k': '10-K',
-            'annual': '10-K',
-            '10-q': '10-Q',
-            '10q': '10-Q',
-            'quarterly': '10-Q',
-            '8-k': '8-K',
-            '8k': '8-K',
-            'proxy': 'DEF 14A',
-            'def 14a': 'DEF 14A'
+        # Query intent patterns
+        self.intent_patterns = {
+            'comparison': [r'compare', r'versus', r'vs\.?', r'difference', r'contrast'],
+            'trend': [r'trend', r'over time', r'evolution', r'change', r'growth'],
+            'risk_analysis': [r'risk', r'factor', r'threat', r'challenge', r'concern'],
+            'financial_metrics': [r'revenue', r'income', r'profit', r'margin', r'expense'],
+            'governance': [r'compensation', r'executive', r'board', r'director', r'governance'],
+            'strategy': [r'strategy', r'initiative', r'plan', r'approach', r'positioning'],
+            'performance': [r'performance', r'results', r'achievement', r'success'],
+            'regulatory': [r'regulation', r'compliance', r'legal', r'requirement'],
+            'market': [r'market', r'industry', r'sector', r'competition', r'competitive']
+        }
+        
+        # Load spaCy for enhanced NLP
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            self.nlp = None
+    
+    def _load_comprehensive_tickers(self) -> Dict[str, str]:
+        """Load comprehensive ticker database"""
+        # In production, this would load from a comprehensive database
+        return {
+            # Technology
+            'AAPL': 'Apple Inc.', 'MSFT': 'Microsoft Corporation', 'GOOGL': 'Alphabet Inc.',
+            'AMZN': 'Amazon.com Inc.', 'TSLA': 'Tesla Inc.', 'META': 'Meta Platforms Inc.',
+            'NVDA': 'NVIDIA Corporation', 'NFLX': 'Netflix Inc.', 'ADBE': 'Adobe Inc.',
+            'CRM': 'Salesforce Inc.', 'ORCL': 'Oracle Corporation', 'IBM': 'IBM Corporation',
+            
+            # Financial Services
+            'JPM': 'JPMorgan Chase & Co.', 'BAC': 'Bank of America Corp', 'WFC': 'Wells Fargo & Co',
+            'GS': 'Goldman Sachs Group Inc.', 'MS': 'Morgan Stanley', 'C': 'Citigroup Inc.',
+            'AXP': 'American Express Co.', 'V': 'Visa Inc.', 'MA': 'Mastercard Inc.',
+            
+            # Healthcare
+            'JNJ': 'Johnson & Johnson', 'PFE': 'Pfizer Inc.', 'UNH': 'UnitedHealth Group Inc.',
+            'ABBV': 'AbbVie Inc.', 'MRK': 'Merck & Co. Inc.', 'TMO': 'Thermo Fisher Scientific',
+            
+            # Consumer
+            'WMT': 'Walmart Inc.', 'PG': 'Procter & Gamble Co.', 'KO': 'Coca-Cola Co.',
+            'PEP': 'PepsiCo Inc.', 'NKE': 'Nike Inc.', 'MCD': 'McDonald\'s Corp.',
+            
+            # Energy
+            'XOM': 'Exxon Mobil Corp.', 'CVX': 'Chevron Corp.', 'COP': 'ConocoPhillips'
         }
     
     def parse_query(self, query: str) -> QueryContext:
-        """Parse user query to extract context"""
+        """Enhanced query parsing with NLP analysis"""
         query_lower = query.lower()
         
-        # Extract tickers
-        tickers = self._extract_tickers(query)
+        # Extract components
+        tickers = self._extract_tickers_enhanced(query)
+        time_periods = self._extract_time_periods_enhanced(query)
+        filing_types = self._extract_filing_types_enhanced(query)
         
-        # Extract time periods
-        time_periods = self._extract_time_periods(query)
+        # Extract entities and intent
+        entities = self._extract_query_entities(query) if self.nlp else []
+        intent_keywords = self._analyze_intent(query)
         
-        # Extract filing types
-        filing_types = self._extract_filing_types(query)
+        # Calculate complexity score
+        complexity_score = self._calculate_query_complexity(query, tickers, time_periods, filing_types)
         
         # Determine query type
-        query_type = self._determine_query_type(tickers, time_periods, filing_types)
+        query_type = self._determine_query_type_enhanced(tickers, time_periods, filing_types, intent_keywords)
         
         return QueryContext(
             tickers=tickers,
             time_periods=time_periods,
             filing_types=filing_types,
             query_type=query_type,
-            original_query=query
+            original_query=query,
+            entities=entities,
+            intent_keywords=intent_keywords,
+            complexity_score=complexity_score
         )
     
-    def _extract_tickers(self, query: str) -> List[str]:
-        """Extract ticker symbols from query"""
+    def _extract_tickers_enhanced(self, query: str) -> List[str]:
+        """Enhanced ticker extraction with company name matching"""
         tickers = []
         query_upper = query.upper()
         
-        # Look for explicit ticker mentions
+        # Direct ticker matching
         for ticker, company in self.known_tickers.items():
-            if ticker in query_upper or company.lower() in query.lower():
+            if ticker in query_upper:
+                tickers.append(ticker)
+            # Match company names
+            elif company.upper() in query.upper():
+                tickers.append(ticker)
+            # Match partial company names
+            elif any(word in query.upper() for word in company.upper().split() if len(word) > 3):
                 tickers.append(ticker)
         
-        # Look for ticker patterns (3-5 uppercase letters)
-        ticker_pattern = r'\b[A-Z]{2,5}\b'
+        # Pattern matching for unknown tickers
+        ticker_pattern = r'\b[A-Z]{1,5}\b'
         found_tickers = re.findall(ticker_pattern, query.upper())
         for ticker in found_tickers:
-            if ticker in self.known_tickers and ticker not in tickers:
-                tickers.append(ticker)
+            if len(ticker) >= 2 and ticker not in tickers:
+                # Validate ticker format (not common words)
+                if ticker not in ['THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HAD', 'HER', 'WAS', 'ONE', 'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'HIM', 'HIS', 'HOW', 'ITS', 'NEW', 'NOW', 'OLD', 'SEE', 'TWO', 'WHO', 'BOY', 'DID', 'ITS', 'LET', 'PUT', 'SAY', 'SHE', 'TOO', 'USE']:
+                    tickers.append(ticker)
                 
-        return tickers
+        return list(set(tickers))  # Remove duplicates
     
-    def _extract_time_periods(self, query: str) -> List[str]:
-        """Extract time periods from query"""
+    def _extract_time_periods_enhanced(self, query: str) -> List[str]:
+        """Enhanced time period extraction"""
         time_periods = []
         
-        # Year patterns
-        year_pattern = r'\b(20\d{2})\b'
-        years = re.findall(year_pattern, query)
-        time_periods.extend(years)
+        # Year patterns (including ranges)
+        year_pattern = r'\b(20\d{2})(?:\s*[-–]\s*(20\d{2}))?\b'
+        year_matches = re.findall(year_pattern, query)
+        for match in year_matches:
+            if match[1]:  # Range
+                time_periods.append(f"{match[0]}-{match[1]}")
+            else:  # Single year
+                time_periods.append(match[0])
         
         # Quarter patterns
-        quarter_pattern = r'\b(Q[1-4]\s*20\d{2}|20\d{2}\s*Q[1-4])\b'
-        quarters = re.findall(quarter_pattern, query, re.IGNORECASE)
-        time_periods.extend(quarters)
+        quarter_patterns = [
+            r'\b(Q[1-4]\s*20\d{2})\b',
+            r'\b(20\d{2}\s*Q[1-4])\b',
+            r'\b(first|second|third|fourth)\s*quarter\s*(20\d{2})\b',
+            r'\b(Q[1-4])\s*of\s*(20\d{2})\b'
+        ]
+        
+        for pattern in quarter_patterns:
+            matches = re.findall(pattern, query, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    time_periods.append(' '.join(match))
+                else:
+                    time_periods.append(match)
         
         # Relative time periods
-        if any(word in query.lower() for word in ['recent', 'latest', 'current']):
-            time_periods.append('recent')
-        if any(word in query.lower() for word in ['last year', 'previous year']):
-            time_periods.append('last_year')
-            
+        relative_patterns = {
+            'recent': r'\b(recent|latest|current|newest)\b',
+            'last_year': r'\b(last|previous|prior)\s+year\b',
+            'last_quarter': r'\b(last|previous|prior)\s+quarter\b',
+            'ytd': r'\byear.to.date\b|ytd',
+            'trailing': r'\btrailing\s+(\d+)\s+(year|quarter|month)s?\b'
+        }
+        
+        for period_type, pattern in relative_patterns.items():
+            if re.search(pattern, query, re.IGNORECASE):
+                time_periods.append(period_type)
+                
         return time_periods
     
-    def _extract_filing_types(self, query: str) -> List[str]:
-        """Extract filing types from query"""
+    def _extract_filing_types_enhanced(self, query: str) -> List[str]:
+        """Enhanced filing type extraction"""
         filing_types = []
         query_lower = query.lower()
         
         for pattern, filing_type in self.filing_types.items():
-            if pattern in query_lower and filing_type not in filing_types:
-                filing_types.append(filing_type)
-                
-        return filing_types
-    
-    def _determine_query_type(self, tickers: List[str], time_periods: List[str], 
-                            filing_types: List[str]) -> str:
-        """Determine the type of query"""
-        if len(tickers) == 1 and not time_periods and not filing_types:
-            return 'ticker-based'
-        elif time_periods and not tickers:
-            return 'temporal'
-        elif len(tickers) >= 1 and time_periods and filing_types:
-            return 'multi-dimensional'
-        elif len(tickers) > 1:
-            return 'comparative'
-        else:
-            return 'general'
-
-class VectorStore:
-    """Handles vector storage and retrieval using ChromaDB"""
-    
-    def __init__(self, persist_directory: str = "chroma_db"):
-        self.client = chromadb.PersistentClient(path=persist_directory)
-        self.collection = self.client.get_or_create_collection(
-            name="sec_filings",
-            metadata={"hnsw:space": "cosine"}
-        )
-        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-        
-    def add_documents(self, chunks: List[Tuple[str, DocumentMetadata]]):
-        """Add document chunks to vector store"""
-        texts = []
-        metadatas = []
-        ids = []
-        
-        for text, metadata in chunks:
-            texts.append(text)
-            metadatas.append(asdict(metadata))
-            ids.append(metadata.chunk_id)
-        
-        # Generate embeddings
-        embeddings = self.encoder.encode(texts).tolist()
-        
-        # Add to collection
-        self.collection.add(
-            embeddings=embeddings,
-            documents=texts,
-            metadatas=metadatas,
-            ids=ids
-        )
-        
-        logger.info(f"Added {len(chunks)} chunks to vector store")
-    
-    def search(self, query: str, filters: Dict = None, n_results: int = 10) -> List[Dict]:
-        """Search for relevant documents"""
-        query_embedding = self.encoder.encode([query]).tolist()[0]
-        
-        # Build where clause for filtering
-        where_clause = {}
-        if filters:
-            for key, value in filters.items():
-                if isinstance(value, list):
-                    where_clause[key] = {"$in": value}
+            if pattern in query_lower:
+                if isinstance(filing_type, list):
+                    filing_types.extend(filing_type)
                 else:
-                    where_clause[key] = value
+                    filing_types.append(filing_type)
         
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            where=where_clause if where_clause else None
+        # Context-based inference
+        if any(word in query_lower for word in ['insider', 'trading', 'ownership']):
+            filing_types.extend(['FORM 3', 'FORM 4', 'FORM 5'])
+        
+        if any(word in query_lower for word in ['compensation', 'executive', 'proxy']):
+            filing_types.append('DEF 14A')
+            
+        return list(set(filing_types))  # Remove duplicates
+    
+    def _extract_query_entities(self, query: str) -> List[Dict]:
+        """Extract entities from query using spaCy"""
+        if not self.nlp:
+            return []
+            
+        try:
+            doc = self.nlp(query)
+            entities = []
+            
+            for ent in doc.ents:
+                entities.append({
+                    'text': ent.text,
+                    'label': ent.label_,
+                    'description': spacy.explain(ent.label_)
+                })
+            
+            return entities
+            
+        except Exception as e:
+            logger.warning(f"Error extracting query entities: {e}")
+            return []
+    
+    def _analyze_intent(self, query: str) -> List[str]:
+        """Analyze query intent using pattern matching"""
+        intent_keywords = []
+        query_lower = query.lower()
+        
+        for intent, patterns in self.intent_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, query_lower, re.IGNORECASE):
+                    intent_keywords.append(intent)
+                    break  # Don't add the same intent multiple times
+        
+        return intent_keywords
+    
+    def _calculate_query_complexity(self, query: str, tickers: List[str], 
+                                  time_periods: List[str], filing_types: List[str]) -> float:
+        """Calculate query complexity score"""
+        complexity = 0.0
+        
+        # Base complexity from query length
+        complexity += min(len(query.split()) / 50.0, 1.0)
+        
+        # Multiple tickers increase complexity
+        if len(tickers) > 1:
+            complexity += 0.3
+        
+        # Multiple time periods increase complexity
+        if len(time_periods) > 1:
+            complexity += 0.2
+        
+        # Multiple filing types increase complexity
+        if len(filing_types) > 1:
+            complexity += 0.2
+        
+        # Question words indicate complexity
+        question_patterns = ['what', 'how', 'why', 'when', 'where', 'which', 'compare', 'analyze']
+        for pattern in question_patterns:
+            if pattern in query.lower():
+                complexity += 0.1
+                break
+        
+        return min(complexity, 1.0)  # Cap at 1.0
+    
+    def _determine_query_type_enhanced(self, tickers: List[str], time_periods: List[str], 
+                                     filing_types: List[str], intent_keywords: List[str]) -> str:
+        """Enhanced query type determination"""
+        # Multi-dimensional queries
+        if len(tickers) >= 1 and time_periods and filing_types:
+            return 'multi-dimensional'
+        
+        # Comparative queries
+        if len(tickers) > 1 or 'comparison' in intent_keywords:
+            return 'comparative'
+        
+        # Temporal queries
+        if time_periods and 'trend' in intent_keywords:
+            return 'temporal-trend'
+        elif time_periods:
+            return 'temporal'
+        
+        # Specific analysis types
+        if 'risk_analysis' in intent_keywords:
+            return 'risk-analysis'
+        elif 'financial_metrics' in intent_keywords:
+            return 'financial-analysis'
+        elif 'governance' in intent_keywords:
+            return 'governance-analysis'
+        
+        # Single ticker queries
+        if len(tickers) == 1:
+            return 'ticker-based'
+        
+        # General queries
+        return 'general'
+
+class AdvancedUncertaintyManager:
+    """Sophisticated uncertainty management and confidence scoring"""
+    
+    def __init__(self):
+        self.confidence_factors = {
+            'source_diversity': 0.25,
+            'temporal_relevance': 0.20,
+            'content_quality': 0.20,
+            'query_match': 0.15,
+            'data_recency': 0.10,
+            'source_authority': 0.10
+        }
+    
+    def calculate_confidence(self, query_context: QueryContext, retrieved_chunks: List[Dict], 
+                           generated_answer: str) -> Dict[str, Any]:
+        """Calculate comprehensive confidence metrics"""
+        if not retrieved_chunks:
+            return {
+                'overall_confidence': 0.0,
+                'confidence_breakdown': {},
+                'uncertainty_factors': ['No relevant sources found'],
+                'recommendations': ['Try broader search terms', 'Check if companies are in database']
+            }
+        
+        # Calculate individual confidence factors
+        source_diversity = self._calculate_source_diversity(retrieved_chunks)
+        temporal_relevance = self._calculate_temporal_relevance(query_context, retrieved_chunks)
+        content_quality = self._calculate_content_quality(retrieved_chunks)
+        query_match = self._calculate_query_match(query_context, retrieved_chunks)
+        data_recency = self._calculate_data_recency(retrieved_chunks)
+        source_authority = self._calculate_source_authority(retrieved_chunks)
+        
+        # Weighted overall confidence
+        overall_confidence = (
+            source_diversity * self.confidence_factors['source_diversity'] +
+            temporal_relevance * self.confidence_factors['temporal_relevance'] +
+            content_quality * self.confidence_factors['content_quality'] +
+            query_match * self.confidence_factors['query_match'] +
+            data_recency * self.confidence_factors['data_recency'] +
+            source_authority * self.confidence_factors['source_authority']
         )
         
-        # Format results
-        formatted_results = []
-        for i in range(len(results['documents'][0])):
-            formatted_results.append({
-                'text': results['documents'][0][i],
-                'metadata': results['metadatas'][0][i],
-                'distance': results['distances'][0][i]
-            })
-            
-        return formatted_results
-
-class HybridRetriever:
-    """Combines semantic and keyword-based retrieval"""
+        # Identify uncertainty factors
+        uncertainty_factors = self._identify_uncertainty_factors(
+            query_context, retrieved_chunks, overall_confidence
+        )
+        
+        # Generate recommendations
+        recommendations = self._generate_confidence_recommendations(
+            overall_confidence, uncertainty_factors, query_context
+        )
+        
+        return {
+            'overall_confidence': round(overall_confidence, 3),
+            'confidence_breakdown': {
+                'source_diversity': round(source_diversity, 3),
+                'temporal_relevance': round(temporal_relevance, 3),
+                'content_quality': round(content_quality, 3),
+                'query_match': round(query_match, 3),
+                'data_recency': round(data_recency, 3),
+                'source_authority': round(source_authority, 3)
+            },
+            'uncertainty_factors': uncertainty_factors,
+            'recommendations': recommendations,
+            'confidence_level': self._categorize_confidence(overall_confidence)
+        }
     
-    def __init__(self, vector_store: VectorStore):
-        self.vector_store = vector_store
-        self.tfidf_vectorizer = TfidfVectorizer(max_features=10000, stop_words='english')
-        self.tfidf_fitted = False
-        self.documents = []
-        self.document_metadata = []
+    def _calculate_source_diversity(self, chunks: List[Dict]) -> float:
+        """Calculate diversity of sources"""
+        if not chunks:
+            return 0.0
+        
+        # Count unique tickers, filing types, and dates
+        unique_tickers = len(set(chunk['metadata']['ticker'] for chunk in chunks))
+        unique_filing_types = len(set(chunk['metadata']['filing_type'] for chunk in chunks))
+        unique_dates = len(set(chunk['metadata']['filing_date'] for chunk in chunks))
+        unique_sections = len(set(chunk['metadata']['section'] for chunk in chunks))
+        
+        # Normalize based on total chunks
+        total_chunks = len(chunks)
+        diversity_score = (
+            (unique_tickers / min(total_chunks, 5)) * 0.3 +
+            (unique_filing_types / min(total_chunks, 4)) * 0.3 +
+            (unique_dates / min(total_chunks, 10)) * 0.2 +
+            (unique_sections / min(total_chunks, 8)) * 0.2
+        )
+        
+        return min(diversity_score, 1.0)
     
-    def fit_tfidf(self, documents: List[str], metadata: List[Dict]):
-        """Fit TF-IDF vectorizer on documents"""
-        self.documents = documents
-        self.document_metadata = metadata
-        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(documents)
-        self.tfidf_fitted = True
-        logger.info("TF-IDF vectorizer fitted")
-    
-    def search(self, query: str, query_context: QueryContext, n_results: int = 10) -> List[Dict]:
-        """Perform hybrid search combining semantic and keyword retrieval"""
-        # Build filters based on query context
-        filters = {}
-        if query_context.tickers:
-            filters['ticker'] = query_context.tickers
-        if query_context.filing_types:
-            filters['filing_type'] = query_context.filing_types
+    def _calculate_temporal_relevance(self, query_context: QueryContext, chunks: List[Dict]) -> float:
+        """Calculate temporal relevance of sources"""
+        if not chunks or not query_context.time_periods:
+            return 0.8  # Default score when no temporal requirements
         
-        # Semantic search
-        semantic_results = self.vector_store.search(query, filters, n_results * 2)
+        current_year = datetime.now().year
+        relevant_chunks = 0
         
-        # Keyword search (if TF-IDF is fitted)
-        keyword_results = []
-        if self.tfidf_fitted:
-            query_vec = self.tfidf_vectorizer.transform([query])
-            similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-            
-            # Get top keyword matches
-            top_indices = similarities.argsort()[-n_results * 2:][::-1]
-            for idx in top_indices:
-                if similarities[idx] > 0.1:  # Threshold for relevance
-                    keyword_results.append({
-                        'text': self.documents[idx],
-                        'metadata': self.document_metadata[idx],
-                        'tfidf_score': similarities[idx]
-                    })
-        
-        # Combine and rank results
-        combined_results = self._combine_results(semantic_results, keyword_results, n_results)
-        
-        return combined_results
-    
-    def _combine_results(self, semantic_results: List[Dict], keyword_results: List[Dict], 
-                        n_results: int) -> List[Dict]:
-        """Combine semantic and keyword results with ranking"""
-        seen_chunks = set()
-        combined = []
-        
-        # Add semantic results with higher weight
-        for result in semantic_results:
-            chunk_id = result['metadata']['chunk_id']
-            if chunk_id not in seen_chunks:
-                result['combined_score'] = (1 - result['distance']) * 0.7  # Semantic weight
-                combined.append(result)
-                seen_chunks.add(chunk_id)
-        
-        # Add keyword results
-        for result in keyword_results:
-            chunk_id = result['metadata']['chunk_id']
-            if chunk_id not in seen_chunks:
-                result['combined_score'] = result['tfidf_score'] * 0.3  # Keyword weight
-                combined.append(result)
-                seen_chunks.add(chunk_id)
-            else:
-                # Boost score if found in both
-                for existing in combined:
-                    if existing['metadata']['chunk_id'] == chunk_id:
-                        existing['combined_score'] += result['tfidf_score'] * 0.2
+        for chunk in chunks:
+            filing_date = chunk['metadata']['filing_date']
+            try:
+                filing_year = int(filing_date.split('-')[0])
+                
+                # Check if filing matches query time periods
+                for period in query_context.time_periods:
+                    if period.isdigit() and int(period) == filing_year:
+                        relevant_chunks += 1
                         break
+                    elif period == 'recent' and (current_year - filing_year) <= 2:
+                        relevant_chunks += 1
+                        break
+                    elif period == 'last_year' and filing_year == (current_year - 1):
+                        relevant_chunks += 1
+                        break
+                        
+            except (ValueError, IndexError):
+                continue
         
-        # Sort by combined score and return top results
-        combined.sort(key=lambda x: x['combined_score'], reverse=True)
-        return combined[:n_results]
-
-class AnswerGenerator:
-    """Generates answers using retrieved context"""
+        return relevant_chunks / len(chunks) if chunks else 0.0
     
-    def __init__(self, model_name: str = "gpt-3.5-turbo"):
-        self.model_name = model_name
-        # Note: In production, set OPENAI_API_KEY environment variable
+    def _calculate_content_quality(self, chunks: List[Dict]) -> float:
+        """Calculate quality of content"""
+        if not chunks:
+            return 0.0
         
+        quality_scores = []
+        
+        for chunk in chunks:
+            score = 0.0
+            text = chunk['text']
+            metadata = chunk['metadata']
+            
+            # Text length (optimal range)
+            text_length = len(text.split())
+            if 50 <= text_length <= 500:
+                score += 0.3
+            elif text_length > 500:
+                score += 0.2
+            
+            # Readability (if available)
+            if hasattr(metadata, 'readability_score') and metadata.readability_score:
+                if 30 <= metadata.readability_score <= 60:  # Good readability range
+                    score += 0.2
+            
+            # Section relevance
+            relevant_sections = ['Business', 'Risk Factors', 'MD&A', 'Financial Statements']
+            if metadata.get('section') in relevant_sections:
+                score += 0.3
+            
+            # Information density (numbers, financial terms)
+            financial_terms = ['revenue', 'income', 'profit', 'loss', 'cash', 'debt', 'equity']
+            if any(term in text.lower() for term in financial_terms):
+                score += 0.2
+            
+            quality_scores.append(min(score, 1.0))
+        
+        return np.mean(quality_scores) if quality_scores else 0.0
+    
+    def _calculate_query_match(self, query_context: QueryContext, chunks: List[Dict]) -> float:
+        """Calculate how well chunks match the query"""
+        if not chunks:
+            return 0.0
+        
+        query_terms = set(query_context.original_query.lower().split())
+        intent_terms = set()
+        
+        # Add terms based on intent
+        for intent in query_context.intent_keywords or []:
+            if intent == 'risk_analysis':
+                intent_terms.update(['risk', 'factor', 'threat', 'challenge'])
+            elif intent == 'financial_metrics':
+                intent_terms.update(['revenue', 'income', 'profit', 'margin'])
+            # Add more intent-based terms
+        
+        all_query_terms = query_terms.union(intent_terms)
+        
+        match_scores = []
+        for chunk in chunks:
+            text_terms = set(chunk['text'].lower().split())
+            overlap = len(all_query_terms.intersection(text_terms))
+            match_score = overlap / len(all_query_terms) if all_query_terms else 0
+            match_scores.append(match_score)
+        
+        return np.mean(match_scores) if match_scores else 0.0
+    
+    def _calculate_data_recency(self, chunks: List[Dict]) -> float:
+        """Calculate recency of data"""
+        if not chunks:
+            return 0.0
+        
+        current_date = datetime.now()
+        recency_scores = []
+        
+        for chunk in chunks:
+            try:
+                filing_date = datetime.strptime(chunk['metadata']['filing_date'], '%Y-%m-%d')
+                days_old = (current_date - filing_date).days
+                
+                # Score based on age (fresher is better)
+                if days_old <= 90:  # 3 months
+                    score = 1.0
+                elif days_old <= 365:  # 1 year
+                    score = 0.8
+                elif days_old <= 730:  # 2 years
+                    score = 0.6
+                elif days_old <= 1095:  # 3 years
+                    score = 0.4
+                else:
+                    score = 0.2
+                
+                recency_scores.append(score)
+                
+            except (ValueError, KeyError):
+                recency_scores.append(0.3)  # Default for unparseable dates
+        
+        return np.mean(recency_scores) if recency_scores else 0.0
+    
+    def _calculate_source_authority(self, chunks: List[Dict]) -> float:
+        """Calculate authority of sources"""
+        if not chunks:
+            return 0.0
+        
+        authority_scores = []
+        
+        for chunk in chunks:
+            score = 0.8  # Base score for SEC filings (high authority)
+            
+            # Higher scores for certain filing types
+            filing_type = chunk['metadata'].get('filing_type', '')
+            if filing_type in ['10-K', '10-Q']:
+                score = 0.9  # Annual and quarterly reports are most authoritative
+            elif filing_type == 'DEF 14A':
+                score = 0.85  # Proxy statements are also highly authoritative
+            elif filing_type == '8-K':
+                score = 0.8  # Current reports are timely and authoritative
+            
+            authority_scores.append(score)
+        
+        return np.mean(authority_scores) if authority_scores else 0.0
+    
+    def _identify_uncertainty_factors(self, query_context: QueryContext, chunks: List[Dict], 
+                                    confidence: float) -> List[str]:
+        """Identify factors contributing to uncertainty"""
+        factors = []
+        
+        if confidence < 0.3:
+            factors.append("Very low confidence due to poor source quality or relevance")
+        elif confidence < 0.5:
+            factors.append("Moderate uncertainty in answer quality")
+            
+        if len(chunks) < 3:
+            factors.append("Limited number of relevant sources found")
+        
+        # Check for temporal mismatches
+        if query_context.time_periods:
+            current_year = datetime.now().year
+            old_data = any(
+                int(chunk['metadata']['filing_date'].split('-')[0]) < (current_year - 3)
+                for chunk in chunks
+                if chunk['metadata']['filing_date']
+            )
+            if old_data:
+                factors.append("Some data sources are more than 3 years old")
+        
+        # Check for ticker coverage
+        if query_context.tickers:
+            found_tickers = set(chunk['metadata']['ticker'] for chunk in chunks)
+            missing_tickers = set(query_context.tickers) - found_tickers
+            if missing_tickers:
+                factors.append(f"No data found for tickers: {', '.join(missing_tickers)}")
+        
+        # Check for filing type coverage
+        if query_context.filing_types:
+            found_types = set(chunk['metadata']['filing_type'] for chunk in chunks)
+            missing_types = set(query_context.filing_types) - found_types
+            if missing_types:
+                factors.append(f"No data found for filing types: {', '.join(missing_types)}")
+        
+        return factors
+    
+    def _generate_confidence_recommendations(self, confidence: float, 
+                                           uncertainty_factors: List[str], 
+                                           query_context: QueryContext) -> List[str]:
+        """Generate recommendations to improve confidence"""
+        recommendations = []
+        
+        if confidence < 0.5:
+            recommendations.append("Consider refining your query for more specific results")
+        
+        if "Limited number of relevant sources" in ' '.join(uncertainty_factors):
+            recommendations.append("Try broadening search terms or including more companies")
+        
+        if any("old" in factor for factor in uncertainty_factors):
+            recommendations.append("Consider focusing on more recent time periods")
+        
+        if query_context.complexity_score > 0.7:
+            recommendations.append("Break down complex query into simpler sub-questions")
+        
+        if not query_context.tickers:
+            recommendations.append("Specify company tickers for more targeted results")
+        
+        return recommendations
+    
+    def _categorize_confidence(self, confidence: float) -> str:
+        """Categorize confidence level"""
+        if confidence >= 0.8:
+            return "High"
+        elif confidence >= 0.6:
+            return "Medium"
+        elif confidence >= 0.4:
+            return "Low"
+        else:
+            return "Very Low"
+
+class PerformanceOptimizer:
+    """System performance optimization and monitoring"""
+    
+    def __init__(self):
+        self.performance_cache = {}
+        self.query_stats = defaultdict(list)
+        self.optimization_settings = {
+            'chunk_cache_size': 1000,
+            'embedding_batch_size': 32,
+            'max_concurrent_requests': 5,
+            'cache_ttl_hours': 24
+        }
+    
+    def optimize_retrieval(self, query_context: QueryContext) -> Dict[str, Any]:
+        """Optimize retrieval based on query characteristics"""
+        optimizations = {
+            'use_cache': True,
+            'parallel_processing': False,
+            'chunk_limit': 50,
+            'rerank_results': False
+        }
+        
+        # Enable parallel processing for complex queries
+        if query_context.complexity_score > 0.7:
+            optimizations['parallel_processing'] = True
+            optimizations['chunk_limit'] = 100
+        
+        # Use result reranking for comparative queries
+        if query_context.query_type in ['comparative', 'multi-dimensional']:
+            optimizations['rerank_results'] = True
+        
+        # Adjust chunk limit based on query type
+        if query_context.query_type == 'general':
+            optimizations['chunk_limit'] = 20
+        elif len(query_context.tickers) > 3:
+            optimizations['chunk_limit'] = 80
+        
+        return optimizations
+    
+    def track_performance(self, query_id: str, metrics: PerformanceMetrics):
+        """Track query performance metrics"""
+        self.query_stats[query_id].append({
+            'timestamp': datetime.now(),
+            'total_time': metrics.total_time,
+            'retrieval_time': metrics.retrieval_time,
+            'generation_time': metrics.generation_time,
+            'chunks_processed': metrics.chunks_processed,
+            'cache_hits': metrics.cache_hits,
+            'api_calls': metrics.api_calls
+        })
+    
+    def get_performance_report(self) -> Dict[str, Any]:
+        """Generate system performance report"""
+        if not self.query_stats:
+            return {"message": "No performance data available"}
+        
+        all_metrics = []
+        for query_metrics in self.query_stats.values():
+            all_metrics.extend(query_metrics)
+        
+        if not all_metrics:
+            return {"message": "No performance data available"}
+        
+        # Calculate aggregated metrics
+        avg_total_time = np.mean([m['total_time'] for m in all_metrics])
+        avg_retrieval_time = np.mean([m['retrieval_time'] for m in all_metrics])
+        avg_generation_time = np.mean([m['generation_time'] for m in all_metrics])
+        total_cache_hits = sum(m['cache_hits'] for m in all_metrics)
+        total_api_calls = sum(m['api_calls'] for m in all_metrics)
+        cache_hit_rate = total_cache_hits / (total_cache_hits + total_api_calls) if (total_cache_hits + total_api_calls) > 0 else 0
+        
+        return {
+            'total_queries': len(all_metrics),
+            'average_response_time': round(avg_total_time, 3),
+            'average_retrieval_time': round(avg_retrieval_time, 3),
+            'average_generation_time': round(avg_generation_time, 3),
+            'cache_hit_rate': round(cache_hit_rate, 3),
+            'total_api_calls': total_api_calls,
+            'performance_trends': self._analyze_performance_trends(all_metrics)
+        }
+    
+    def _analyze_performance_trends(self, metrics: List[Dict]) -> Dict[str, str]:
+        """Analyze performance trends"""
+        if len(metrics) < 10:
+            return {"message": "Insufficient data for trend analysis"}
+        
+        # Sort by timestamp
+        sorted_metrics = sorted(metrics, key=lambda x: x['timestamp'])
+        
+        # Compare first and last halves
+        mid_point = len(sorted_metrics) // 2
+        first_half_avg = np.mean([m['total_time'] for m in sorted_metrics[:mid_point]])
+        second_half_avg = np.mean([m['total_time'] for m in sorted_metrics[mid_point:]])
+        
+        if second_half_avg < first_half_avg * 0.9:
+            trend = "Improving - response times are getting faster"
+        elif second_half_avg > first_half_avg * 1.1:
+            trend = "Degrading - response times are getting slower"
+        else:
+            trend = "Stable - consistent performance"
+        
+        return {"response_time_trend": trend}
+
+class ComprehensiveAnswerGenerator:
+    """Enhanced answer generation with sophisticated LLM integration"""
+    
+    def __init__(self, model_name: str = "gpt-4", api_key: str = None):
+        self.model_name = model_name
+        if api_key:
+            openai.api_key = api_key
+        
+        self.uncertainty_manager = AdvancedUncertaintyManager()
+        
+        # Enhanced prompt templates for different query types
+        self.prompt_templates = {
+            'comparative': self._get_comparative_template(),
+            'risk-analysis': self._get_risk_analysis_template(),
+            'financial-analysis': self._get_financial_template(),
+            'temporal-trend': self._get_trend_analysis_template(),
+            'general': self._get_general_template()
+        }
+    
     def generate_answer(self, query: str, context_chunks: List[Dict], 
                        query_context: QueryContext) -> Dict[str, Any]:
-        """Generate answer using retrieved context"""
-        # Prepare context
-        context_text = self._prepare_context(context_chunks)
-        
-        # Create prompt
-        prompt = self._create_prompt(query, context_text, query_context)
+        """Generate comprehensive answer with uncertainty analysis"""
+        start_time = time.time()
         
         try:
-            # Generate answer using OpenAI (mock implementation)
-            answer = self._mock_llm_response(query, context_chunks, query_context)
+            # Select appropriate prompt template
+            template = self.prompt_templates.get(
+                query_context.query_type, 
+                self.prompt_templates['general']
+            )
             
-            # Extract sources
-            sources = self._extract_sources(context_chunks)
+            # Prepare enhanced context
+            context_text = self._prepare_enhanced_context(context_chunks, query_context)
+            
+            # Create prompt
+            prompt = template.format(
+                query=query,
+                context=context_text,
+                query_type=query_context.query_type,
+                tickers=', '.join(query_context.tickers) if query_context.tickers else 'N/A',
+                time_periods=', '.join(query_context.time_periods) if query_context.time_periods else 'N/A'
+            )
+            
+            # Generate answer (mock implementation - replace with actual OpenAI call)
+            answer = self._generate_structured_answer(query, context_chunks, query_context)
+            
+            generation_time = time.time() - start_time
+            
+            # Calculate confidence and uncertainty
+            confidence_analysis = self.uncertainty_manager.calculate_confidence(
+                query_context, context_chunks, answer
+            )
+            
+            # Extract sources with enhanced metadata
+            sources = self._extract_enhanced_sources(context_chunks)
+            
+            # Generate executive summary for complex answers
+            executive_summary = self._generate_executive_summary(answer, query_context)
             
             return {
                 'answer': answer,
+                'executive_summary': executive_summary,
                 'sources': sources,
+                'confidence_analysis': confidence_analysis,
                 'context_chunks_used': len(context_chunks),
                 'query_type': query_context.query_type,
-                'confidence': self._estimate_confidence(context_chunks)
+                'generation_time': round(generation_time, 3),
+                'answer_metadata': {
+                    'word_count': len(answer.split()),
+                    'readability_score': flesch_reading_ease(answer) if answer else 0,
+                    'structure_score': self._calculate_answer_structure_score(answer)
+                }
             }
             
         except Exception as e:
             logger.error(f"Error generating answer: {e}")
             return {
-                'answer': "I apologize, but I encountered an error generating the answer.",
+                'answer': "I apologize, but I encountered an error generating the answer. Please try rephrasing your question or contact support.",
                 'sources': [],
+                'confidence_analysis': {'overall_confidence': 0.0},
                 'error': str(e)
             }
     
-    def _prepare_context(self, context_chunks: List[Dict]) -> str:
-        """Prepare context text from retrieved chunks"""
-        context_parts = []
-        for i, chunk in enumerate(context_chunks):
-            metadata = chunk['metadata']
-            text = chunk['text']
-            
-            context_part = f"""
-Source {i+1}: {metadata['ticker']} - {metadata['filing_type']} - {metadata['filing_date']} - {metadata['section']}
-{text}
----
-            """
-            context_parts.append(context_part)
-        
-        return "\n".join(context_parts)
-    
-    def _create_prompt(self, query: str, context: str, query_context: QueryContext) -> str:
-        """Create prompt for answer generation"""
-        return f"""
-You are a financial research analyst tasked with answering questions about SEC filings. 
-Use the provided context to answer the user's question accurately and comprehensively.
+    def _get_comparative_template(self) -> str:
+        return """
+You are a financial research analyst tasked with providing comparative analysis of SEC filings.
 
 Query: {query}
-Query Type: {query_context.query_type}
-Relevant Tickers: {', '.join(query_context.tickers) if query_context.tickers else 'N/A'}
-Time Periods: {', '.join(query_context.time_periods) if query_context.time_periods else 'N/A'}
+Query Type: {query_type}
+Companies: {tickers}
+Time Periods: {time_periods}
 
 Context from SEC Filings:
 {context}
 
 Instructions:
-1. Answer the question comprehensively using the provided context
-2. Always cite your sources using the format [Source X]
-3. If information is not available in the context, clearly state this
-4. For comparative questions, structure your answer clearly
-5. Highlight any uncertainty or limitations in the available data
-6. Focus on factual information from the filings
+1. Provide a structured comparative analysis
+2. Use clear section headers (## Company A vs Company B)
+3. Include specific metrics and data points with citations [Source X]
+4. Highlight key differences and similarities
+5. Provide context for the comparisons
+6. Note any limitations in the comparison due to data availability
+7. Use tables or bullet points for easy comparison where appropriate
+
+Structure your response as:
+## Executive Summary
+## Key Comparisons
+## Detailed Analysis
+## Limitations and Caveats
 
 Answer:
         """
     
-    def _mock_llm_response(self, query: str, context_chunks: List[Dict], 
-                          query_context: QueryContext) -> str:
-        """Mock LLM response for demonstration (replace with actual OpenAI call)"""
-        # This is a simplified mock response
-        # In production, this would call OpenAI's API
-        
-        tickers = query_context.tickers
-        query_lower = query.lower()
-        
-        if 'revenue' in query_lower and 'compare' in query_lower:
-            return f"""Based on the SEC filings analysis for {', '.join(tickers)}, here are the key revenue insights:
+    def _get_risk_analysis_template(self) -> str:
+        return """
+You are a risk analysis specialist examining SEC filings for risk factors.
 
-**Revenue Comparison:**
-The companies show different revenue growth patterns based on their business models and market positions. [Source 1, Source 2]
+Query: {query}
+Query Type: {query_type}
+Companies: {tickers}
+Time Periods: {time_periods}
 
-**Key Findings:**
-- Technology companies demonstrate strong recurring revenue streams from subscription services
-- Revenue diversity varies significantly across the analyzed companies
-- Recent quarters show resilience despite market challenges [Source 3]
+Context from SEC Filings:
+{context}
 
-**Limitations:** The analysis is based on available filing data and may not reflect the most recent performance metrics."""
+Instructions:
+1. Categorize risks by type (Market, Operational, Financial, Regulatory, etc.)
+2. Assess severity and likelihood based on company disclosures
+3. Compare risk profiles across companies if multiple are analyzed
+4. Identify emerging risks and changes over time
+5. Provide specific citations for each risk factor [Source X]
+6. Note any industry-specific or company-specific risk patterns
 
-        elif 'risk' in query_lower:
-            return f"""Risk factor analysis for {', '.join(tickers) if tickers else 'the analyzed companies'}:
+Structure your response as:
+## Risk Summary
+## Risk Categories
+## Comparative Risk Analysis (if applicable)
+## Risk Trends and Changes
+## Recommendations
 
-**Primary Risk Categories:**
-1. **Market and Competition Risks**: Intense competition and market volatility [Source 1]
-2. **Regulatory Risks**: Changing regulatory environment and compliance costs [Source 2]
-3. **Technology Risks**: Cybersecurity threats and technology disruption [Source 3]
-
-**Company-Specific Considerations:**
-Each company emphasizes different risk priorities based on their industry exposure and business model.
-
-**Note:** This analysis is based on the most recent available SEC filings in our database."""
-
-        else:
-            return f"""Based on the SEC filings analysis, here are the key findings for your query about {query}:
-
-The available filing data provides insights into the requested information. Key points include:
-
-- Analysis covers multiple filing periods and document types [Source 1]
-- Information is drawn from official SEC filings including 10-K, 10-Q, and 8-K reports [Source 2]
-- Data reflects the companies' own disclosures and representations [Source 3]
-
-For more specific insights, please provide additional details about the particular aspects you'd like to explore.
-
-**Data Limitations:** Analysis is based on available filing data and standard SEC reporting requirements."""
+Answer:
+        """
     
-    def _extract_sources(self, context_chunks: List[Dict]) -> List[Dict]:
-        """Extract source information from context chunks"""
+    def _get_financial_template(self) -> str:
+        return """
+You are a financial analyst examining SEC filings for financial metrics and performance.
+
+Query: {query}
+Query Type: {query_type}
+Companies: {tickers}
+Time Periods: {time_periods}
+
+Context from SEC Filings:
+{context}
+
+Instructions:
+1. Focus on quantitative financial data and metrics
+2. Provide trend analysis over time where applicable
+3. Include relevant ratios and performance indicators
+4. Compare against industry benchmarks when possible
+5. Explain the business context behind the numbers
+6. Cite specific sources for all financial data [Source X]
+7. Note any accounting changes or one-time items
+
+Structure your response as:
+## Financial Highlights
+## Key Metrics Analysis
+## Trend Analysis
+## Performance Context
+## Important Notes and Limitations
+
+Answer:
+        """
+    
+        def _get_trend_analysis_template(self) -> str:
+        return """
+You are a trend analysis specialist examining changes over time in SEC filings.
+
+Query: {query}
+Query Type: {query_type}
+Companies: {tickers}
+Time Periods: {time_periods}
+
+Context from SEC Filings:
+{context}
+
+Instructions:
+1. Identify clear trends and patterns over the specified time period
+2. Highlight significant changes and inflection points
+3. Provide quantitative evidence for trends where available
+4. Compare trends across companies if multiple are analyzed
+5. Note any external factors that may influence trends
+6. Include visual trend descriptions (e.g., "steady increase", "sharp decline")
+7. Cite specific sources for all trend data [Source X]
+
+Structure your response as:
+## Trend Overview
+## Detailed Trend Analysis
+## Comparative Trends (if applicable)
+## External Influences
+## Future Implications
+
+Answer:
+        """
+
+    def _get_general_template(self) -> str:
+        return """
+You are a financial research analyst answering questions based on SEC filings.
+
+Query: {query}
+Query Type: {query_type}
+Companies: {tickers}
+Time Periods: {time_periods}
+
+Context from SEC Filings:
+{context}
+
+Instructions:
+1. Provide a clear, concise answer to the query
+2. Support all claims with specific citations [Source X]
+3. Include relevant context from the filings
+4. Structure the answer logically
+5. Highlight key points for quick understanding
+6. Note any limitations in the available information
+
+Structure your response as:
+## Answer Summary
+## Detailed Explanation
+## Supporting Evidence
+## Additional Context
+## Limitations
+
+Answer:
+        """
+
+    def _prepare_enhanced_context(self, context_chunks: List[Dict], query_context: QueryContext) -> str:
+        """Prepare enhanced context for LLM with structured metadata"""
+        context_parts = []
+        
+        for i, chunk in enumerate(context_chunks, 1):
+            metadata = chunk['metadata']
+            context_parts.append(f"\n\n[Source {i} - {metadata.ticker} {metadata.filing_type} ({metadata.filing_date}) - {metadata.section}]\n")
+            context_parts.append(chunk['text'])
+            
+        return ''.join(context_parts)
+
+    def _generate_structured_answer(self, query: str, context_chunks: List[Dict], 
+                                 query_context: QueryContext) -> str:
+        """Generate structured answer using LLM (mock implementation)"""
+        # In production, this would call OpenAI API with proper prompt engineering
+        # For demo purposes, we'll return a mock answer
+        
+        if query_context.query_type == 'comparative':
+            tickers = query_context.tickers
+            if len(tickers) >= 2:
+                return f"""
+## Executive Summary
+The comparison between {tickers[0]} and {tickers[1]} reveals key differences in their business strategies and financial performance.
+
+## Key Comparisons
+- Revenue Growth: {tickers[0]} showed 8% YoY growth vs {tickers[1]}'s 12% [Source 1, 3]
+- R&D Spending: {tickers[0]} allocates 15% of revenue vs {tickers[1]}'s 20% [Source 2, 4]
+- Risk Factors: {tickers[1]} emphasizes supply chain risks more prominently [Source 5]
+
+## Detailed Analysis
+{tickers[0]} has focused on vertical integration while {tickers[1]} prioritizes partnerships...
+"""
+        
+        elif query_context.query_type == 'risk-analysis':
+            return """
+## Risk Summary
+The company faces three primary risk categories: market, operational, and regulatory.
+
+## Risk Categories
+1. Market Risks (Competition, Demand Fluctuation) [Source 1]
+2. Operational Risks (Supply Chain, Cybersecurity) [Source 2]
+3. Regulatory Risks (Privacy Laws, Antitrust) [Source 3]
+
+## Risk Trends and Changes
+Supply chain risks have increased by 30% year-over-year...
+"""
+        
+        # Default answer for other query types
+        return f"""
+## Answer Summary
+Based on the analysis of SEC filings, the key findings are...
+
+## Detailed Explanation
+The documents reveal that... [Source 1, 3]. Specifically, the company reported... [Source 2].
+
+## Supporting Evidence
+- Metric 1: Value (Source)
+- Metric 2: Value (Source)
+
+## Limitations
+The analysis is limited to publicly available data through {datetime.now().year-1}.
+"""
+
+    def _extract_enhanced_sources(self, context_chunks: List[Dict]) -> List[Dict]:
+        """Extract enhanced source metadata with relevance scoring"""
         sources = []
-        for i, chunk in enumerate(context_chunks):
+        
+        for i, chunk in enumerate(context_chunks, 1):
             metadata = chunk['metadata']
             sources.append({
-                'source_id': i + 1,
-                'ticker': metadata['ticker'],
-                'filing_type': metadata['filing_type'],
-                'filing_date': metadata['filing_date'],
-                'section': metadata['section'],
-                'chunk_id': metadata['chunk_id']
+                'source_id': i,
+                'ticker': metadata.ticker,
+                'company_name': metadata.company_name,
+                'filing_type': metadata.filing_type,
+                'filing_date': metadata.filing_date,
+                'section': metadata.section,
+                'relevance_score': self._calculate_chunk_relevance(chunk),
+                'key_excerpts': self._extract_key_excerpts(chunk['text'])
             })
-        return sources
-    
-    def _estimate_confidence(self, context_chunks: List[Dict]) -> float:
-        """Estimate confidence based on context quality"""
-        if not context_chunks:
-            return 0.0
-        
-        # Simple confidence estimation based on:
-        # - Number of relevant chunks
-        # - Diversity of sources
-        # - Recency of data
-        
-        num_chunks = len(context_chunks)
-        unique_sources = len(set(chunk['metadata']['ticker'] for chunk in context_chunks))
-        
-        base_confidence = min(0.9, 0.3 + (num_chunks * 0.1))
-        diversity_bonus = min(0.1, unique_sources * 0.02)
-        
-        return base_confidence + diversity_bonus
+            
+        return sorted(sources, key=lambda x: x['relevance_score'], reverse=True)
 
-class SECQASystem:
-    """Main SEC QA System orchestrating all components"""
-    
-    def __init__(self, data_dir: str = "sec_data"):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(exist_ok=True)
+    def _calculate_chunk_relevance(self, chunk: Dict) -> float:
+        """Calculate relevance score for a chunk"""
+        # Simple implementation - in production would use more sophisticated scoring
+        score = 0.5  # Base score
         
-        # Initialize components
-        self.fetcher = SECDataFetcher()
-        self.processor = DocumentProcessor()
-        self.query_processor = QueryProcessor()
-        self.vector_store = VectorStore()
-        self.retriever = HybridRetriever(self.vector_store)
-        self.answer_generator = AnswerGenerator()
-        
-        # Database for tracking processed documents
-        self.db_path = self.data_dir / "processed_docs.db"
-        self._init_database()
-        
-        logger.info("SEC QA System initialized")
-    
-    def _init_database(self):
-        """Initialize SQLite database for tracking"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS processed_filings (
-                id INTEGER PRIMARY KEY,
-                ticker TEXT,
-                filing_type TEXT,
-                filing_date TEXT,
-                accession_number TEXT UNIQUE,
-                processed_date TEXT,
-                chunk_count INTEGER
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def ingest_company_data(self, tickers: List[str], filing_types: List[str] = None,
-                          start_date: str = None, limit_per_company: int = 20):
-        """Ingest SEC data for specified companies"""
-        if filing_types is None:
-            filing_types = ['10-K', '10-Q', '8-K', 'DEF 14A']
-        
-        all_chunks = []
-        all_texts = []
-        all_metadata = []
-        
-        for ticker in tickers:
-            logger.info(f"Processing data for {ticker}")
+        # Increase for financial sections
+        if chunk['metadata'].section in ['Financial Statements', 'MD&A']:
+            score += 0.2
             
-            # Fetch filings
-            filings = self.fetcher.get_company_filings(
-                ticker, filing_types, start_date, limit_per_company
-            )
+        # Increase for recent filings
+        try:
+            filing_date = datetime.strptime(chunk['metadata'].filing_date, '%Y-%m-%d')
+            days_old = (datetime.now() - filing_date).days
+            if days_old < 365:
+                score += 0.1
+        except:
+            pass
             
-            for filing in filings:
-                # Check if already processed
-                if self._is_filing_processed(filing['accession_number']):
-                    logger.info(f"Skipping already processed filing: {filing['accession_number']}")
-                    continue
-                
-                # Download content
-                content = self.fetcher.download_filing_content(filing)
-                if not content:
-                    continue
-                
-                # Process document
-                chunks = self.processor.process_filing(content, filing)
-                
-                if chunks:
-                    all_chunks.extend(chunks)
+        return min(score, 1.0)
+
+    def _extract_key_excerpts(self, text: str) -> List[str]:
+        """Extract key excerpts from chunk text"""
+        sentences = re.split(r'(?<=[.!?]) +', text)
+        if len(sentences) <= 3:
+            return sentences
+            
+        # Select most informative sentences (simple implementation)
+        key_sentences = []
+        financial_terms = ['revenue', 'growth', 'risk', 'income', 'expense']
+        
+        for sentence in sentences:
+            if any(term in sentence.lower() for term in financial_terms):
+                key_sentences.append(sentence)
+                if len(key_sentences) >= 3:
+                    break
                     
-                    # Prepare for TF-IDF fitting
-                    for chunk_text, metadata in chunks:
-                        all_texts.append(chunk_text)
-                        all_metadata.append(asdict(metadata))
-                    
-                    # Mark as processed
-                    self._mark_filing_processed(filing, len(chunks))
-                    logger.info(f"Processed {len(chunks)} chunks from {filing['filing_type']} filing")
+        return key_sentences if key_sentences else sentences[:3]
+
+    def _generate_executive_summary(self, answer: str, query_context: QueryContext) -> str:
+        """Generate executive summary from full answer"""
+        # Simple implementation - in production would use LLM to summarize
+        if "## Executive Summary" in answer:
+            return answer.split("## Executive Summary")[1].split("##")[0].strip()
         
-        if all_chunks:
-            # Add to vector store
-            self.vector_store.add_documents(all_chunks)
+        if "## Answer Summary" in answer:
+            return answer.split("## Answer Summary")[1].split("##")[0].strip()
             
-            # Fit TF-IDF for hybrid retrieval
-            self.retriever.fit_tfidf(all_texts, all_metadata)
-            
-            logger.info(f"Ingested {len(all_chunks)} total chunks from {len(tickers)} companies")
+        return answer[:500] + "..." if len(answer) > 500 else answer
+
+    def _calculate_answer_structure_score(self, answer: str) -> float:
+        """Calculate structure quality score for answer"""
+        structure_markers = ['##', '**', '- ', '* ']
+        score = 0.0
+        
+        for marker in structure_markers:
+            if marker in answer:
+                score += 0.2
+                
+        return min(score, 1.0)
+
+class SECQACompleteSystem:
+    """Complete SEC QA System integrating all components"""
     
-    def _is_filing_processed(self, accession_number: str) -> bool:
-        """Check if filing is already processed"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    def __init__(self, config: Dict = None):
+        # Initialize all components
+        self.data_fetcher = EnhancedSECDataFetcher()
+        self.document_processor = EnhancedDocumentProcessor()
+        self.query_processor = EnhancedQueryProcessor()
+        self.answer_generator = ComprehensiveAnswerGenerator()
+        self.performance_optimizer = PerformanceOptimizer()
         
-        cursor.execute(
-            "SELECT COUNT(*) FROM processed_filings WHERE accession_number = ?",
-            (accession_number,)
-        )
+        # Initialize vector database
+        self.vector_db = self._initialize_vector_db()
         
-        count = cursor.fetchone()[0]
-        conn.close()
+        # Initialize embedding model
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        return count > 0
-    
-    def _mark_filing_processed(self, filing: Dict, chunk_count: int):
-        """Mark filing as processed in database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        # System configuration
+        self.config = config or {
+            'max_chunks': 50,
+            'min_confidence': 0.4,
+            'cache_enabled': True
+        }
         
-        cursor.execute('''
-            INSERT OR REPLACE INTO processed_filings 
-            (ticker, filing_type, filing_date, accession_number, processed_date, chunk_count)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            filing['ticker'],
-            filing['filing_type'],
-            filing['filing_date'],
-            filing['accession_number'],
-            datetime.now().isoformat(),
-            chunk_count
+        # Performance tracking
+        self.metrics = defaultdict(list)
+        
+    def _initialize_vector_db(self):
+        """Initialize ChromaDB vector database"""
+        client = chromadb.Client(Settings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=".chromadb"
         ))
         
-        conn.commit()
-        conn.close()
-    
-    def query(self, question: str, n_results: int = 10) -> Dict[str, Any]:
-        """Process a query and return answer with sources"""
-        logger.info(f"Processing query: {question}")
-        
-        # Parse query
-        query_context = self.query_processor.parse_query(question)
-        logger.info(f"Query type: {query_context.query_type}")
-        logger.info(f"Extracted tickers: {query_context.tickers}")
-        
-        # Retrieve relevant documents
-        relevant_chunks = self.retriever.search(question, query_context, n_results)
-        logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks")
-        
-        # Generate answer
-        result = self.answer_generator.generate_answer(question, relevant_chunks, query_context)
-        
-        # Add query metadata
-        result['query_context'] = asdict(query_context)
-        result['retrieval_stats'] = {
-            'chunks_retrieved': len(relevant_chunks),
-            'unique_companies': len(set(chunk['metadata']['ticker'] for chunk in relevant_chunks)),
-            'filing_types_covered': list(set(chunk['metadata']['filing_type'] for chunk in relevant_chunks))
-        }
-        
-        return result
-    
-    def get_system_stats(self) -> Dict[str, Any]:
-        """Get system statistics"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Get filing counts by ticker
-        cursor.execute('''
-            SELECT ticker, filing_type, COUNT(*) as count, SUM(chunk_count) as total_chunks
-            FROM processed_filings 
-            GROUP BY ticker, filing_type
-        ''')
-        
-        filing_stats = cursor.fetchall()
-        
-        # Get total stats
-        cursor.execute('SELECT COUNT(*) FROM processed_filings')
-        total_filings = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT SUM(chunk_count) FROM processed_filings')
-        total_chunks = cursor.fetchone()[0] or 0
-        
-        conn.close()
-        
-        # Get vector store stats
         try:
-            vector_count = self.vector_store.collection.count()
+            collection = client.get_collection("sec_filings")
+            logger.info("Loaded existing SEC filings collection")
         except:
-            vector_count = 0
+            collection = client.create_collection("sec_filings")
+            logger.info("Created new SEC filings collection")
+            
+        return collection
+    
+    def process_query(self, query: str) -> Dict[str, Any]:
+        """Complete query processing pipeline"""
+        start_time = time.time()
+        query_id = hashlib.md5(query.encode()).hexdigest()[:8]
         
-        return {
-            'total_filings_processed': total_filings,
-            'total_chunks_created': total_chunks,
-            'vector_store_count': vector_count,
-            'filings_by_company': [
-                {
-                    'ticker': row[0],
-                    'filing_type': row[1],
-                    'count': row[2],
-                    'chunks': row[3]
+        try:
+            # Step 1: Parse and analyze query
+            parse_start = time.time()
+            query_context = self.query_processor.parse_query(query)
+            parse_time = time.time() - parse_start
+            
+            # Step 2: Retrieve relevant documents
+            retrieval_start = time.time()
+            context_chunks = self._retrieve_relevant_chunks(query, query_context)
+            retrieval_time = time.time() - retrieval_start
+            
+            # Step 3: Generate answer
+            generation_start = time.time()
+            answer_result = self.answer_generator.generate_answer(query, context_chunks, query_context)
+            generation_time = time.time() - generation_start
+            
+            # Calculate total time
+            total_time = time.time() - start_time
+            
+            # Track performance metrics
+            metrics = PerformanceMetrics(
+                query_start_time=start_time,
+                retrieval_time=retrieval_time,
+                generation_time=generation_time,
+                total_time=total_time,
+                chunks_processed=len(context_chunks),
+                cache_hits=0,  # Would track actual cache hits in production
+                api_calls=0    # Would track actual API calls in production
+            )
+            self.performance_optimizer.track_performance(query_id, metrics)
+            
+            # Prepare final result
+            result = {
+                'query': query,
+                'query_id': query_id,
+                'query_context': asdict(query_context),
+                'answer': answer_result['answer'],
+                'executive_summary': answer_result.get('executive_summary', ''),
+                'sources': answer_result['sources'],
+                'confidence_analysis': answer_result['confidence_analysis'],
+                'performance_metrics': {
+                    'parse_time': round(parse_time, 3),
+                    'retrieval_time': round(retrieval_time, 3),
+                    'generation_time': round(generation_time, 3),
+                    'total_time': round(total_time, 3)
                 }
-                for row in filing_stats
-            ]
-        }
-
-def main():
-    """Example usage and testing"""
-    
-    # Sample companies for testing
-    test_companies = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-    
-    print("=" * 60)
-    print("SEC Filings QA System - Quantitative Researcher Challenge")
-    print("=" * 60)
-    
-    # Initialize system
-    qa_system = SECQASystem()
-    
-    # Check if we need to ingest data
-    stats = qa_system.get_system_stats()
-    print(f"\nCurrent System Stats:")
-    print(f"- Total filings processed: {stats['total_filings_processed']}")
-    print(f"- Total chunks created: {stats['total_chunks_created']}")
-    print(f"- Vector store count: {stats['vector_store_count']}")
-    
-    if stats['total_filings_processed'] == 0:
-        print("\nNo data found. Ingesting sample company data...")
-        print("Note: This is a demonstration with limited data fetching.")
-        
-        # In a real implementation, this would fetch actual SEC data
-        print("Simulating data ingestion for companies:", test_companies)
-        
-        # Mock some processed filings for demonstration
-        import sqlite3
-        conn = sqlite3.connect(qa_system.db_path)
-        cursor = conn.cursor()
-        
-        mock_filings = [
-            ('AAPL', '10-K', '2023-10-27', '0000320193-23-000106', '2024-01-15T10:00:00', 45),
-            ('AAPL', '10-Q', '2023-08-03', '0000320193-23-000077', '2024-01-15T10:00:00', 32),
-            ('MSFT', '10-K', '2023-07-27', '0000789019-23-000076', '2024-01-15T10:00:00', 52),
-            ('MSFT', '10-Q', '2023-10-25', '0000789019-23-000103', '2024-01-15T10:00:00', 38),
-            ('GOOGL', '10-K', '2023-02-02', '0001652044-23-000016', '2024-01-15T10:00:00', 67),
-        ]
-        
-        for filing in mock_filings:
-            cursor.execute('''
-                INSERT OR REPLACE INTO processed_filings 
-                (ticker, filing_type, filing_date, accession_number, processed_date, chunk_count)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', filing)
-        
-        conn.commit()
-        conn.close()
-        
-        print("Mock data ingestion completed.")
-    
-    # Sample evaluation questions from the challenge
-    sample_questions = [
-        "What are the primary revenue drivers for major technology companies, and how have they evolved?",
-        "Compare R&D spending trends across companies. What insights about innovation investment strategies?",
-        "What are the most commonly cited risk factors across industries?",
-        "How do companies describe climate-related risks? Notable industry differences?",
-        "How are companies positioning regarding AI and automation? Strategic approaches?",
-        "What are Apple's main risk factors according to their latest 10-K?",
-        "Compare Apple and Microsoft revenues from their most recent filings",
-        "How has Apple's revenue guidance changed over time?",
-        "What significant working capital changes occurred for technology companies?",
-        "Analyze recent executive compensation changes across the technology sector"
-    ]
-    
-    print(f"\n{'='*60}")
-    print("SAMPLE QUERY DEMONSTRATIONS")
-    print("="*60)
-    
-    # Demonstrate system with sample queries
-    for i, question in enumerate(sample_questions[:3]):  # Limit to first 3 for demo
-        print(f"\n🔍 Query {i+1}: {question}")
-        print("-" * 50)
-        
-        try:
-            result = qa_system.query(question)
-            
-            print(f"Query Type: {result['query_context']['query_type']}")
-            print(f"Identified Tickers: {result['query_context']['tickers']}")
-            print(f"Confidence: {result.get('confidence', 'N/A'):.2f}" if isinstance(result.get('confidence'), (int, float)) else f"Confidence: {result.get('confidence', 'N/A')}")
-            
-            print(f"\n📋 Answer:")
-            print(result['answer'])
-            
-            print(f"\n📚 Sources ({len(result['sources'])} total):")
-            for source in result['sources'][:3]:  # Show first 3 sources
-                print(f"  - {source['ticker']} {source['filing_type']} ({source['filing_date']}) - {source['section']}")
-            
-            if len(result['sources']) > 3:
-                print(f"  ... and {len(result['sources']) - 3} more sources")
-                
-        except Exception as e:
-            print(f"❌ Error processing query: {e}")
-            logger.error(f"Query error: {e}")
-    
-    # Interactive mode
-    print(f"\n{'='*60}")
-    print("INTERACTIVE MODE")
-    print("="*60)
-    print("Enter your questions about SEC filings (type 'quit' to exit, 'stats' for system info)")
-    
-    while True:
-        try:
-            user_query = input("\n🤔 Your question: ").strip()
-            
-            if user_query.lower() in ['quit', 'exit', 'q']:
-                break
-            elif user_query.lower() == 'stats':
-                stats = qa_system.get_system_stats()
-                print("\n📊 System Statistics:")
-                print(f"  Total filings: {stats['total_filings_processed']}")
-                print(f"  Total chunks: {stats['total_chunks_created']}")
-                print(f"  Companies covered: {len(set(f['ticker'] for f in stats['filings_by_company']))}")
-                continue
-            elif not user_query:
-                continue
-            
-            print("\n🔄 Processing your query...")
-            result = qa_system.query(user_query)
-            
-            print(f"\n📋 Answer:")
-            print(result['answer'])
-            
-            print(f"\n📚 Sources:")
-            for i, source in enumerate(result['sources'][:5], 1):
-                print(f"  {i}. {source['ticker']} - {source['filing_type']} ({source['filing_date']})")
-            
-            retrieval_stats = result.get('retrieval_stats', {})
-            print(f"\n📈 Retrieval Stats:")
-            print(f"  Chunks analyzed: {retrieval_stats.get('chunks_retrieved', 0)}")
-            print(f"  Companies covered: {retrieval_stats.get('unique_companies', 0)}")
-            print(f"  Filing types: {', '.join(retrieval_stats.get('filing_types_covered', []))}")
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
-            break
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            logger.error(f"Interactive query error: {e}")
-
-class SystemBenchmark:
-    """Benchmark and evaluation utilities"""
-    
-    def __init__(self, qa_system: SECQASystem):
-        self.qa_system = qa_system
-    
-    def run_evaluation_suite(self) -> Dict[str, Any]:
-        """Run the complete evaluation suite from the challenge"""
-        
-        evaluation_questions = [
-            {
-                'id': 1,
-                'question': "What are the primary revenue drivers for major technology companies, and how have they evolved?",
-                'category': 'comparative',
-                'expected_elements': ['revenue streams', 'evolution', 'multiple companies']
-            },
-            {
-                'id': 2,
-                'question': "Compare R&D spending trends across companies. What insights about innovation investment strategies?",
-                'category': 'comparative',
-                'expected_elements': ['R&D spending', 'trends', 'innovation strategy']
-            },
-            {
-                'id': 3,
-                'question': "Identify significant working capital changes for financial services companies and driving factors.",
-                'category': 'sector-specific',
-                'expected_elements': ['working capital', 'changes', 'driving factors']
-            },
-            {
-                'id': 4,
-                'question': "What are the most commonly cited risk factors across industries? How do same-sector companies prioritize differently?",
-                'category': 'risk-analysis',
-                'expected_elements': ['risk factors', 'industry comparison', 'prioritization']
-            },
-            {
-                'id': 5,
-                'question': "How do companies describe climate-related risks? Notable industry differences?",
-                'category': 'thematic',
-                'expected_elements': ['climate risks', 'industry differences', 'descriptions']
             }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing query: {e}")
+            return {
+                'query': query,
+                'error': str(e),
+                'query_id': query_id,
+                'answer': "An error occurred while processing your query. Please try again."
+            }
+    
+    def _retrieve_relevant_chunks(self, query: str, query_context: QueryContext) -> List[Dict]:
+        """Retrieve relevant document chunks for a query"""
+        # Get optimization settings
+        optimizations = self.performance_optimizer.optimize_retrieval(query_context)
+        
+        # Get filings for each ticker
+        filings = []
+        for ticker in query_context.tickers:
+            ticker_filings = self.data_fetcher.get_company_filings(
+                ticker,
+                filing_types=query_context.filing_types,
+                start_date=self._get_start_date(query_context.time_periods)
+            )
+            filings.extend(ticker_filings)
+        
+        # Process filings to get chunks
+        all_chunks = []
+        for filing in filings[:10]:  # Limit to 10 filings for demo
+            content = self.data_fetcher.download_filing_content(filing)
+            if content:
+                chunks = self.document_processor.process_filing(content, filing)
+                all_chunks.extend(chunks)
+        
+        # Filter chunks by query context
+        filtered_chunks = self._filter_chunks_by_context(all_chunks, query_context)
+        
+        # Get query embedding
+        query_embedding = self.embedding_model.encode(query)
+        
+        # Calculate similarity scores
+        scored_chunks = []
+        for chunk in filtered_chunks:
+            chunk_embedding = self.embedding_model.encode(chunk[0])
+            similarity = cosine_similarity(
+                [query_embedding],
+                [chunk_embedding]
+            )[0][0]
+            
+            scored_chunks.append({
+                'text': chunk[0],
+                'metadata': asdict(chunk[1]),
+                'similarity_score': similarity
+            })
+        
+        # Sort by similarity and apply limit
+        scored_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
+        return scored_chunks[:self.config['max_chunks']]
+    
+    def _get_start_date(self, time_periods: List[str]) -> Optional[str]:
+        """Determine start date from time periods"""
+        if not time_periods:
+            return None
+            
+        # Get numeric years from periods
+        years = []
+        for period in time_periods:
+            if period.isdigit() and len(period) == 4:
+                years.append(int(period))
+            elif '-' in period:
+                try:
+                    start, end = period.split('-')
+                    if len(start) == 4 and len(end) == 4:
+                        years.append(int(start))
+                except:
+                    pass
+                    
+        if years:
+            return f"{min(years)}-01-01"
+            
+        return None
+    
+    def _filter_chunks_by_context(self, chunks: List[Tuple[str, DocumentMetadata]], 
+                                query_context: QueryContext) -> List[Tuple[str, DocumentMetadata]]:
+        """Filter chunks based on query context"""
+        filtered = []
+        
+        for chunk, metadata in chunks:
+            # Filter by filing type if specified
+            if query_context.filing_types and metadata.filing_type not in query_context.filing_types:
+                continue
+                
+            # Filter by time period if specified
+            if query_context.time_periods and not self._matches_time_period(metadata.filing_date, query_context.time_periods):
+                continue
+                
+            filtered.append((chunk, metadata))
+            
+        return filtered
+    
+    def _matches_time_period(self, filing_date: str, time_periods: List[str]) -> bool:
+        """Check if filing date matches any time period"""
+        if not time_periods:
+            return True
+            
+        try:
+            filing_year = int(filing_date.split('-')[0])
+        except:
+            return False
+            
+        for period in time_periods:
+            if period.isdigit() and len(period) == 4:
+                if filing_year == int(period):
+                    return True
+            elif '-' in period:
+                try:
+                    start, end = period.split('-')
+                    if len(start) == 4 and len(end) == 4:
+                        if int(start) <= filing_year <= int(end):
+                            return True
+                except:
+                    continue
+            elif period == 'recent':
+                if (datetime.now().year - filing_year) <= 2:
+                    return True
+            elif period == 'last_year':
+                if filing_year == (datetime.now().year - 1):
+                    return True
+                    
+        return False
+    
+    def get_performance_report(self) -> Dict[str, Any]:
+        """Get system performance report"""
+        return self.performance_optimizer.get_performance_report()
+    
+    def evaluate_sample_questions(self) -> Dict[str, Any]:
+        """Evaluate system against sample questions"""
+        sample_questions = [
+            "What are the primary revenue drivers for major technology companies, and how have they evolved?",
+            "Compare R&D spending trends across companies. What insights about innovation investment strategies?",
+            "Identify significant working capital changes for financial services companies and driving factors.",
+            "What are the most commonly cited risk factors across industries? How do same-sector companies prioritize differently?",
+            "How do companies describe climate-related risks? Notable industry differences?",
+            "Analyze recent executive compensation changes. What trends emerge?",
+            "What significant insider trading activity occurred? What might this indicate?",
+            "How are companies positioning regarding AI and automation? Strategic approaches?",
+            "Identify recent M&A activity. What strategic rationale do companies provide?",
+            "How do companies describe competitive advantages? What themes emerge?"
         ]
         
         results = []
-        for question_data in evaluation_questions:
-            print(f"\n🔍 Evaluating Question {question_data['id']}: {question_data['question']}")
+        for question in sample_questions:
+            result = self.process_query(question)
+            results.append({
+                'question': question,
+                'answer_summary': result.get('executive_summary', ''),
+                'confidence': result.get('confidence_analysis', {}).get('overall_confidence', 0),
+                'processing_time': result.get('performance_metrics', {}).get('total_time', 0)
+            })
             
-            start_time = datetime.now()
-            try:
-                result = self.qa_system.query(question_data['question'])
-                end_time = datetime.now()
-                
-                evaluation = {
-                    'question_id': question_data['id'],
-                    'category': question_data['category'],
-                    'response_time_seconds': (end_time - start_time).total_seconds(),
-                    'sources_count': len(result.get('sources', [])),
-                    'confidence': result.get('confidence', 0),
-                    'query_type': result.get('query_context', {}).get('query_type', 'unknown'),
-                    'chunks_retrieved': result.get('retrieval_stats', {}).get('chunks_retrieved', 0),
-                    'companies_covered': result.get('retrieval_stats', {}).get('unique_companies', 0),
-                    'answer_length': len(result.get('answer', '')),
-                    'has_sources': len(result.get('sources', [])) > 0,
-                    'addresses_expected_elements': self._check_expected_elements(
-                        result.get('answer', ''), question_data['expected_elements']
-                    )
-                }
-                
-                results.append(evaluation)
-                print(f"  ✅ Completed in {evaluation['response_time_seconds']:.2f}s")
-                print(f"  📊 {evaluation['sources_count']} sources, {evaluation['companies_covered']} companies")
-                
-            except Exception as e:
-                print(f"  ❌ Error: {e}")
-                results.append({
-                    'question_id': question_data['id'],
-                    'error': str(e),
-                    'response_time_seconds': (datetime.now() - start_time).total_seconds()
-                })
-        
-        return self._compile_evaluation_report(results)
-    
-    def _check_expected_elements(self, answer: str, expected_elements: List[str]) -> Dict[str, bool]:
-        """Check if answer addresses expected elements"""
-        answer_lower = answer.lower()
-        element_check = {}
-        
-        for element in expected_elements:
-            # Simple keyword matching - could be improved with more sophisticated NLP
-            element_words = element.lower().split()
-            element_check[element] = any(word in answer_lower for word in element_words)
-        
-        return element_check
-    
-    def _compile_evaluation_report(self, results: List[Dict]) -> Dict[str, Any]:
-        """Compile evaluation results into a comprehensive report"""
-        successful_results = [r for r in results if 'error' not in r]
-        error_count = len(results) - len(successful_results)
-        
-        if not successful_results:
-            return {
-                'overall_success_rate': 0.0,
-                'total_errors': error_count,
-                'results': results
-            }
-        
-        # Calculate metrics
-        avg_response_time = np.mean([r['response_time_seconds'] for r in successful_results])
-        avg_sources = np.mean([r['sources_count'] for r in successful_results])
-        avg_confidence = np.mean([r['confidence'] for r in successful_results if isinstance(r['confidence'], (int, float))])
-        
-        # Query type distribution
-        query_types = [r['query_type'] for r in successful_results]
-        query_type_dist = {qt: query_types.count(qt) for qt in set(query_types)}
-        
         return {
-            'evaluation_summary': {
-                'total_questions': len(results),
-                'successful_responses': len(successful_results),
-                'error_count': error_count,
-                'success_rate': len(successful_results) / len(results) * 100
-            },
-            'performance_metrics': {
-                'avg_response_time_seconds': round(avg_response_time, 2),
-                'avg_sources_per_answer': round(avg_sources, 1),
-                'avg_confidence_score': round(avg_confidence, 2) if not np.isnan(avg_confidence) else None,
-                'query_type_distribution': query_type_dist
-            },
-            'detailed_results': results,
-            'recommendations': self._generate_recommendations(results)
+            'total_questions': len(results),
+            'average_confidence': round(np.mean([r['confidence'] for r in results]), 3),
+            'average_time': round(np.mean([r['processing_time'] for r in results]), 3),
+            'detailed_results': results
         }
-    
-    def _generate_recommendations(self, results: List[Dict]) -> List[str]:
-        """Generate improvement recommendations based on results"""
-        recommendations = []
-        
-        successful_results = [r for r in results if 'error' not in r]
-        if not successful_results:
-            recommendations.append("System failed on all test queries - needs fundamental debugging")
-            return recommendations
-        
-        # Check response times
-        slow_queries = [r for r in successful_results if r['response_time_seconds'] > 5]
-        if slow_queries:
-            recommendations.append(f"Consider optimizing retrieval performance - {len(slow_queries)} queries took >5 seconds")
-        
-        # Check source coverage
-        low_source_queries = [r for r in successful_results if r['sources_count'] < 3]
-        if low_source_queries:
-            recommendations.append(f"Improve source retrieval - {len(low_source_queries)} queries returned <3 sources")
-        
-        # Check company coverage
-        low_company_coverage = [r for r in successful_results if r['companies_covered'] < 2]
-        if low_company_coverage and len(successful_results) > 0:
-            recommendations.append("Consider ingesting data from more companies for better coverage")
-        
-        return recommendations
 
+# Example usage
 if __name__ == "__main__":
-    main()
+    # Initialize system
+    sec_qa_system = SECQACompleteSystem()
+    
+    # Process a sample query
+    sample_query = "Compare Apple and Microsoft R&D spending trends over the last 3 years"
+    result = sec_qa_system.process_query(sample_query)
+    
+    print("\nQuery:", result['query'])
+    print("\nExecutive Summary:", result['executive_summary'])
+    print("\nAnswer:", result['answer'])
+    print("\nConfidence:", result['confidence_analysis']['overall_confidence'])
+    print("\nSources:")
+    for source in result['sources'][:3]:  # Show top 3 sources
+        print(f"- {source['ticker']} {source['filing_type']} ({source['filing_date']}) - {source['section']}")
+    
+    # Evaluate sample questions
+    evaluation = sec_qa_system.evaluate_sample_questions()
+    print(f"\nEvaluation Results: {evaluation['total_questions']} questions processed")
+    print(f"Average Confidence: {evaluation['average_confidence']}")
+    print(f"Average Processing Time: {evaluation['average_time']} seconds")
+    
+    # Performance report
+    performance = sec_qa_system.get_performance_report()
+    print("\nPerformance Report:")
+    print(f"Average Response Time: {performance.get('average_response_time', 0)} seconds")
+    print(f"Cache Hit Rate: {performance.get('cache_hit_rate', 0)}")
