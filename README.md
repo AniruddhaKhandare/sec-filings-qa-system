@@ -163,6 +163,7 @@ sec-filings-qa-system/
 ├── data/                       # Data directory
 │   └── .gitkeep
 └── tests/                      # Test suite
+    ├── __init__.py
     ├── test_query_processor.py
     └── test_retrieval.py
 ```
