@@ -233,17 +233,48 @@ class EnhancedSECDataFetcher:
             return []
     
     def _fetch_older_filings(self, cik: str, filing_types: List[str], start_date: str, 
-                           remaining_limit: int, company_info: Dict) -> List[Dict]:
-        """Fetch older filings from additional archives"""
-        try:
-            self._rate_limit()
-            
-            # This would involve fetching older filing archives
-            # Implementation depends on SEC's archive structure
-            # For now, return empty list but framework is in place
-            logger.info(f"Would fetch {remaining_limit} older filings for CIK {cik}")
-            return []
-            
+                       remaining_limit: int, company_info: Dict) -> List[Dict]:
+    """Fetch older filings from additional archives"""
+    try:
+        self._rate_limit()
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        response = self.session.get(url)
+        
+        data = response.json()
+        older_files = data.get('filings', {}).get('files', [])
+        
+        results = []
+        for older_file in older_files:
+            if len(results) >= remaining_limit:
+                break
+                
+            try:
+                older_url = f"https://data.sec.gov/submissions/{older_file['name']}"
+                older_response = self.session.get(older_url)
+                older_data = older_response.json()
+                
+                for i, form_type in enumerate(older_data.get('form', [])):
+                    if form_type in filing_types and len(results) < remaining_limit:
+                        filing_info = {
+                            'ticker': company_info.get('name', '').split()[0],
+                            'company_name': company_info.get('name', ''),
+                            'filing_type': form_type,
+                            'filing_date': older_data['filingDate'][i],
+                            'accession_number': older_data['accessionNumber'][i],
+                            'primary_document': older_data['primaryDocument'][i],
+                            'cik': cik
+                        }
+                        results.append(filing_info)
+            except Exception as file_error:
+                logger.warning(f"Error processing older file {older_file.get('name')}: {file_error}")
+                continue
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Error fetching older filings: {e}")
+        return []
+
         except Exception as e:
             logger.error(f"Error fetching older filings: {e}")
             return []
@@ -1259,7 +1290,7 @@ class PerformanceOptimizer:
 class ComprehensiveAnswerGenerator:
     """Enhanced answer generation with sophisticated LLM integration"""
     
-    def __init__(self, model_name: str = "gpt-4", api_key: str = None):
+    def __init__(self, model_name: str = "gpt-3.5-turbo", api_key: str = None):
         self.model_name = model_name
         if api_key:
             openai.api_key = api_key
@@ -1503,25 +1534,83 @@ Answer:
         return ''.join(context_parts)
 
     def _generate_structured_answer(self, query: str, context_chunks: List[Dict], 
-                                 query_context: QueryContext) -> str:
-        """Generate structured answer using LLM (mock implementation)"""
-        # In production, this would call OpenAI API with proper prompt engineering
-        # For demo purposes, we'll return a mock answer
+                             query_context: QueryContext) -> str:
+    """Generate structured answer using actual OpenAI API"""
+    try:
+        template = self.prompt_templates.get(
+            query_context.query_type, 
+            self.prompt_templates['general']
+        )
         
-        if query_context.query_type == 'comparative':
-            tickers = query_context.tickers
-            if len(tickers) >= 2:
-                return f"""
-## Executive Summary
-The comparison between {tickers[0]} and {tickers[1]} reveals key differences in their business strategies and financial performance.
+        context_text = self._prepare_enhanced_context(context_chunks, query_context)
+        
+        prompt = template.format(
+            query=query,
+            context=context_text,
+            query_type=query_context.query_type,
+            tickers=', '.join(query_context.tickers) if query_context.tickers else 'N/A',
+            time_periods=', '.join(query_context.time_periods) if query_context.time_periods else 'N/A'
+        )
+        
+        # Check if OpenAI API key is available
+        if not openai.api_key:
+            logger.warning("OpenAI API key not set, using fallback response")
+            return self._generate_fallback_answer(query, context_chunks, query_context)
+        
+        # Actual OpenAI API call
+        response = openai.ChatCompletion.create(
+            model=self.model_name,
+            messages=[
+                {"role": "system", "content": "You are a financial research analyst specializing in SEC filings analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.1
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        logger.error(f"OpenAI API error: {e}")
+        return self._generate_fallback_answer(query, context_chunks, query_context)
 
-## Key Comparisons
-- Revenue Growth: {tickers[0]} showed 8% YoY growth vs {tickers[1]}'s 12% [Source 1, 3]
-- R&D Spending: {tickers[0]} allocates 15% of revenue vs {tickers[1]}'s 20% [Source 2, 4]
-- Risk Factors: {tickers[1]} emphasizes supply chain risks more prominently [Source 5]
+    def _generate_fallback_answer(self, query: str, context_chunks: List[Dict], 
+                            query_context: QueryContext) -> str:
+    """Generate fallback answer when OpenAI is not available"""
+    if not context_chunks:
+        return "I couldn't find relevant information in the SEC filings to answer your question."
+    
+    # Extract key information from chunks
+    sources_info = []
+    for i, chunk in enumerate(context_chunks[:5], 1):
+        metadata = chunk['metadata']
+        sources_info.append(f"[Source {i}] {metadata.get('ticker', 'Unknown')} {metadata.get('filing_type', '')} ({metadata.get('filing_date', '')}) - {metadata.get('section', '')}")
+    
+    if query_context.query_type == 'comparative':
+        tickers = query_context.tickers
+        return f"""
+## Analysis Summary
+Based on SEC filings for {', '.join(tickers) if tickers else 'the requested companies'}, here are the key findings:
 
-## Detailed Analysis
-{tickers[0]} has focused on vertical integration while {tickers[1]} prioritizes partnerships...
+## Key Information Found
+{chr(10).join(sources_info)}
+
+## Note
+This is a basic response. For detailed analysis, please ensure OpenAI API key is configured.
+
+## Sources Referenced
+{len(context_chunks)} relevant document sections were analyzed.
+"""
+    else:
+        return f"""
+## Answer Summary
+Based on the available SEC filing data, I found relevant information across {len(context_chunks)} document sections.
+
+## Key Sources
+{chr(10).join(sources_info)}
+
+## Note
+This is a basic response. For detailed analysis with specific insights and comparisons, please ensure OpenAI API key is configured.
 """
         
         elif query_context.query_type == 'risk-analysis':
@@ -1675,6 +1764,93 @@ class SECQACompleteSystem:
             logger.info("Created new SEC filings collection")
             
         return collection
+
+    def setup_system(self, tickers: List[str] = None):
+        """Setup system by downloading and processing initial data"""
+        if not tickers:
+            tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']  # Default tickers
+        
+        logger.info(f"Setting up system with tickers: {tickers}")
+        
+        all_chunks = []
+        for ticker in tickers:
+            logger.info(f"Processing {ticker}...")
+            
+            try:
+                # Get recent filings
+                filings = self.data_fetcher.get_company_filings(ticker, limit=3)
+                
+                for filing in filings:
+                    content = self.data_fetcher.download_filing_content(filing)
+                    if content:
+                        chunks = self.document_processor.process_filing(content, filing)
+                        all_chunks.extend(chunks)
+                        
+                        # Process in batches to avoid memory issues
+                        if len(all_chunks) >= 50:
+                            self._populate_vector_db(all_chunks)
+                            all_chunks = []
+            except Exception as e:
+                logger.error(f"Error processing ticker {ticker}: {e}")
+                continue
+        
+        # Process remaining chunks
+        if all_chunks:
+            self._populate_vector_db(all_chunks)
+        
+        logger.info("System setup complete")
+
+    def _populate_vector_db(self, chunks: List[Tuple[str, DocumentMetadata]]):
+        """Actually store embeddings in ChromaDB"""
+        if not chunks:
+            return
+            
+        try:
+            texts = [chunk[0] for chunk in chunks]
+            embeddings = self.embedding_model.encode(texts)
+            
+            # Generate unique IDs and metadata
+            ids = [f"{chunk[1].ticker}_{chunk[1].chunk_id}_{hash(chunk[0])}" for chunk in chunks]
+            metadatas = [asdict(chunk[1]) for chunk in chunks]
+            
+            # Add to vector database
+            self.vector_db.add(
+                embeddings=embeddings.tolist(),
+                documents=texts,
+                metadatas=metadatas,
+                ids=ids
+            )
+            
+            logger.info(f"Added {len(chunks)} chunks to vector database")
+            
+        except Exception as e:
+            logger.error(f"Error populating vector database: {e}")
+
+    def _retrieve_from_vector_db(self, query: str, n_results: int = 50) -> List[Dict]:
+        """Retrieve similar chunks from vector database"""
+        try:
+            query_embedding = self.embedding_model.encode([query])
+            
+            results = self.vector_db.query(
+                query_embeddings=query_embedding.tolist(),
+                n_results=min(n_results, 100)  # ChromaDB limit
+            )
+            
+            chunks = []
+            if results['documents'] and results['documents'][0]:
+                for i in range(len(results['documents'][0])):
+                    chunks.append({
+                        'text': results['documents'][0][i],
+                        'metadata': results['metadatas'][0][i],
+                        'similarity_score': 1 - results['distances'][0][i] if results['distances'][0] else 0.5
+                    })
+            
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Error retrieving from vector database: {e}")
+            return []
+
     
     def process_query(self, query: str) -> Dict[str, Any]:
         """Complete query processing pipeline"""
@@ -1741,93 +1917,92 @@ class SECQACompleteSystem:
             }
     
     def _retrieve_relevant_chunks(self, query: str, query_context: QueryContext) -> List[Dict]:
-        """Retrieve relevant document chunks for a query"""
-        # Get optimization settings
-        optimizations = self.performance_optimizer.optimize_retrieval(query_context)
+    """Retrieve relevant document chunks for a query"""
+    try:
+        # First try to retrieve from vector database
+        chunks_from_db = self._retrieve_from_vector_db(query, n_results=100)
         
-        # Get filings for each ticker
+        if chunks_from_db:
+            # Filter by query context
+            filtered_chunks = self._filter_chunks_by_context_dict(chunks_from_db, query_context)
+            if filtered_chunks:
+                return filtered_chunks[:self.config['max_chunks']]
+        
+        # Fallback: fetch and process new documents
+        logger.info("No relevant chunks in database, fetching new documents...")
+        
         filings = []
-        for ticker in query_context.tickers:
+        for ticker in query_context.tickers or ['AAPL']:  # Default to AAPL if no tickers
             ticker_filings = self.data_fetcher.get_company_filings(
                 ticker,
                 filing_types=query_context.filing_types,
-                start_date=self._get_start_date(query_context.time_periods)
+                start_date=self._get_start_date(query_context.time_periods),
+                limit=5
             )
             filings.extend(ticker_filings)
         
         # Process filings to get chunks
         all_chunks = []
-        for filing in filings[:10]:  # Limit to 10 filings for demo
+        for filing in filings[:5]:  # Limit to 5 filings
             content = self.data_fetcher.download_filing_content(filing)
             if content:
                 chunks = self.document_processor.process_filing(content, filing)
                 all_chunks.extend(chunks)
         
-        # Filter chunks by query context
-        filtered_chunks = self._filter_chunks_by_context(all_chunks, query_context)
-        
-        # Get query embedding
-        query_embedding = self.embedding_model.encode(query)
-        
-        # Calculate similarity scores
-        scored_chunks = []
-        for chunk in filtered_chunks:
-            chunk_embedding = self.embedding_model.encode(chunk[0])
-            similarity = cosine_similarity(
-                [query_embedding],
-                [chunk_embedding]
-            )[0][0]
+        if all_chunks:
+            # Add to vector database for future use
+            self._populate_vector_db(all_chunks)
             
-            scored_chunks.append({
-                'text': chunk[0],
-                'metadata': asdict(chunk[1]),
-                'similarity_score': similarity
-            })
-        
-        # Sort by similarity and apply limit
-        scored_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
-        return scored_chunks[:self.config['max_chunks']]
-    
-    def _get_start_date(self, time_periods: List[str]) -> Optional[str]:
-        """Determine start date from time periods"""
-        if not time_periods:
-            return None
+            # Filter and score chunks
+            filtered_chunks = self._filter_chunks_by_context(all_chunks, query_context)
             
-        # Get numeric years from periods
-        years = []
-        for period in time_periods:
-            if period.isdigit() and len(period) == 4:
-                years.append(int(period))
-            elif '-' in period:
-                try:
-                    start, end = period.split('-')
-                    if len(start) == 4 and len(end) == 4:
-                        years.append(int(start))
-                except:
-                    pass
-                    
-        if years:
-            return f"{min(years)}-01-01"
+            # Convert to dict format and calculate similarity
+            query_embedding = self.embedding_model.encode(query)
+            scored_chunks = []
             
-        return None
-    
-    def _filter_chunks_by_context(self, chunks: List[Tuple[str, DocumentMetadata]], 
-                                query_context: QueryContext) -> List[Tuple[str, DocumentMetadata]]:
-        """Filter chunks based on query context"""
-        filtered = []
-        
-        for chunk, metadata in chunks:
-            # Filter by filing type if specified
-            if query_context.filing_types and metadata.filing_type not in query_context.filing_types:
-                continue
+            for chunk_text, chunk_metadata in filtered_chunks:
+                chunk_embedding = self.embedding_model.encode(chunk_text)
+                similarity = cosine_similarity([query_embedding], [chunk_embedding])[0][0]
                 
-            # Filter by time period if specified
-            if query_context.time_periods and not self._matches_time_period(metadata.filing_date, query_context.time_periods):
-                continue
-                
-            filtered.append((chunk, metadata))
+                scored_chunks.append({
+                    'text': chunk_text,
+                    'metadata': asdict(chunk_metadata),
+                    'similarity_score': similarity
+                })
             
-        return filtered
+            scored_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
+            return scored_chunks[:self.config['max_chunks']]
+        
+        return []
+        
+    except Exception as e:
+        logger.error(f"Error retrieving relevant chunks: {e}")
+        return []
+
+def _filter_chunks_by_context_dict(self, chunks: List[Dict], query_context: QueryContext) -> List[Dict]:
+    """Filter chunks when they come from vector DB as dicts"""
+    filtered = []
+    
+    for chunk in chunks:
+        metadata = chunk['metadata']
+        
+        # Filter by ticker
+        if query_context.tickers and metadata.get('ticker') not in query_context.tickers:
+            continue
+            
+        # Filter by filing type
+        if query_context.filing_types and metadata.get('filing_type') not in query_context.filing_types:
+            continue
+            
+        # Filter by time period
+        if query_context.time_periods and not self._matches_time_period(
+            metadata.get('filing_date', ''), query_context.time_periods
+        ):
+            continue
+            
+        filtered.append(chunk)
+    
+    return filtered
     
     def _matches_time_period(self, filing_date: str, time_periods: List[str]) -> bool:
         """Check if filing date matches any time period"""
@@ -1898,29 +2073,41 @@ class SECQACompleteSystem:
 
 # Example usage
 if __name__ == "__main__":
+    import os
+    
+    # Set OpenAI API key (get from environment or set directly)
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    if openai_api_key:
+        openai.api_key = openai_api_key
+        print("✓ OpenAI API key loaded")
+    else:
+        print("⚠ OpenAI API key not found. Set OPENAI_API_KEY environment variable or system will use fallback responses.")
+    
     # Initialize system
+    print("Initializing SEC QA System...")
     sec_qa_system = SECQACompleteSystem()
     
+    # Setup system with sample companies (this will take a few minutes)
+    print("Setting up system with sample companies...")
+    sec_qa_system.setup_system(['AAPL', 'MSFT'])
+    
     # Process a sample query
-    sample_query = "Compare Apple and Microsoft R&D spending trends over the last 3 years"
+    sample_query = "Compare Apple and Microsoft R&D spending trends"
+    print(f"\nProcessing query: {sample_query}")
     result = sec_qa_system.process_query(sample_query)
     
-    print("\nQuery:", result['query'])
-    print("\nExecutive Summary:", result['executive_summary'])
-    print("\nAnswer:", result['answer'])
-    print("\nConfidence:", result['confidence_analysis']['overall_confidence'])
-    print("\nSources:")
-    for source in result['sources'][:3]:  # Show top 3 sources
-        print(f"- {source['ticker']} {source['filing_type']} ({source['filing_date']}) - {source['section']}")
+    print("\n" + "="*80)
+    print("QUERY RESULT")
+    print("="*80)
+    print("\nQuery:", result.get('query', 'N/A'))
+    print("\nAnswer:", result.get('answer', 'N/A'))
+    print("\nConfidence:", result.get('confidence_analysis', {}).get('overall_confidence', 'N/A'))
     
-    # Evaluate sample questions
-    evaluation = sec_qa_system.evaluate_sample_questions()
-    print(f"\nEvaluation Results: {evaluation['total_questions']} questions processed")
-    print(f"Average Confidence: {evaluation['average_confidence']}")
-    print(f"Average Processing Time: {evaluation['average_time']} seconds")
+    sources = result.get('sources', [])
+    if sources:
+        print(f"\nTop {min(3, len(sources))} Sources:")
+        for i, source in enumerate(sources[:3], 1):
+            print(f"{i}. {source.get('ticker', 'N/A')} {source.get('filing_type', 'N/A')} ({source.get('filing_date', 'N/A')})")
     
-    # Performance report
-    performance = sec_qa_system.get_performance_report()
-    print("\nPerformance Report:")
-    print(f"Average Response Time: {performance.get('average_response_time', 0)} seconds")
-    print(f"Cache Hit Rate: {performance.get('cache_hit_rate', 0)}")
+    print(f"\nProcessing Time: {result.get('total_time', 'N/A')} seconds")
+    print("="*80)
