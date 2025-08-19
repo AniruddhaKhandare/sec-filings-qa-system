@@ -233,48 +233,44 @@ class EnhancedSECDataFetcher:
             return []
     
     def _fetch_older_filings(self, cik: str, filing_types: List[str], start_date: str, 
-                       remaining_limit: int, company_info: Dict) -> List[Dict]:
-    """Fetch older filings from additional archives"""
-    try:
-        self._rate_limit()
-        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        response = self.session.get(url)
-        
-        data = response.json()
-        older_files = data.get('filings', {}).get('files', [])
-        
-        results = []
-        for older_file in older_files:
-            if len(results) >= remaining_limit:
-                break
-                
-            try:
-                older_url = f"https://data.sec.gov/submissions/{older_file['name']}"
-                older_response = self.session.get(older_url)
-                older_data = older_response.json()
-                
-                for i, form_type in enumerate(older_data.get('form', [])):
-                    if form_type in filing_types and len(results) < remaining_limit:
-                        filing_info = {
-                            'ticker': company_info.get('name', '').split()[0],
-                            'company_name': company_info.get('name', ''),
-                            'filing_type': form_type,
-                            'filing_date': older_data['filingDate'][i],
-                            'accession_number': older_data['accessionNumber'][i],
-                            'primary_document': older_data['primaryDocument'][i],
-                            'cik': cik
-                        }
-                        results.append(filing_info)
-            except Exception as file_error:
-                logger.warning(f"Error processing older file {older_file.get('name')}: {file_error}")
-                continue
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error fetching older filings: {e}")
-        return []
-
+                           remaining_limit: int, company_info: Dict) -> List[Dict]:
+        """Fetch older filings from additional archives"""
+        try:
+            self._rate_limit()
+            url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+            response = self.session.get(url)
+            
+            data = response.json()
+            older_files = data.get('filings', {}).get('files', [])
+            
+            results = []
+            for older_file in older_files:
+                if len(results) >= remaining_limit:
+                    break
+                    
+                try:
+                    older_url = f"https://data.sec.gov/submissions/{older_file['name']}"
+                    older_response = self.session.get(older_url)
+                    older_data = older_response.json()
+                    
+                    for i, form_type in enumerate(older_data.get('form', [])):
+                        if form_type in filing_types and len(results) < remaining_limit:
+                            filing_info = {
+                                'ticker': company_info.get('name', '').split()[0],
+                                'company_name': company_info.get('name', ''),
+                                'filing_type': form_type,
+                                'filing_date': older_data['filingDate'][i],
+                                'accession_number': older_data['accessionNumber'][i],
+                                'primary_document': older_data['primaryDocument'][i],
+                                'cik': cik
+                            }
+                            results.append(filing_info)
+                except Exception as file_error:
+                    logger.warning(f"Error processing older file {older_file.get('name')}: {file_error}")
+                    continue
+            
+            return results
+            
         except Exception as e:
             logger.error(f"Error fetching older filings: {e}")
             return []
@@ -1010,8 +1006,9 @@ class AdvancedUncertaintyManager:
                 score += 0.2
             
             # Readability (if available)
-            if hasattr(metadata, 'readability_score') and metadata.readability_score:
-                if 30 <= metadata.readability_score <= 60:  # Good readability range
+            if metadata.get('readability_score'):
+                readability = metadata['readability_score']
+                if 30 <= readability <= 60:  # Good readability range
                     score += 0.2
             
             # Section relevance
@@ -1461,7 +1458,7 @@ Structure your response as:
 Answer:
         """
     
-        def _get_trend_analysis_template(self) -> str:
+    def _get_trend_analysis_template(self) -> str:
         return """
 You are a trend analysis specialist examining changes over time in SEC filings.
 
@@ -1528,67 +1525,67 @@ Answer:
         
         for i, chunk in enumerate(context_chunks, 1):
             metadata = chunk['metadata']
-            context_parts.append(f"\n\n[Source {i} - {metadata.ticker} {metadata.filing_type} ({metadata.filing_date}) - {metadata.section}]\n")
+            context_parts.append(f"\n\n[Source {i} - {metadata.get('ticker', 'N/A')} {metadata.get('filing_type', 'N/A')} ({metadata.get('filing_date', 'N/A')}) - {metadata.get('section', 'N/A')}]\n")
             context_parts.append(chunk['text'])
             
         return ''.join(context_parts)
 
     def _generate_structured_answer(self, query: str, context_chunks: List[Dict], 
                              query_context: QueryContext) -> str:
-    """Generate structured answer using actual OpenAI API"""
-    try:
-        template = self.prompt_templates.get(
-            query_context.query_type, 
-            self.prompt_templates['general']
-        )
-        
-        context_text = self._prepare_enhanced_context(context_chunks, query_context)
-        
-        prompt = template.format(
-            query=query,
-            context=context_text,
-            query_type=query_context.query_type,
-            tickers=', '.join(query_context.tickers) if query_context.tickers else 'N/A',
-            time_periods=', '.join(query_context.time_periods) if query_context.time_periods else 'N/A'
-        )
-        
-        # Check if OpenAI API key is available
-        if not openai.api_key:
-            logger.warning("OpenAI API key not set, using fallback response")
+        """Generate structured answer using actual OpenAI API"""
+        try:
+            template = self.prompt_templates.get(
+                query_context.query_type, 
+                self.prompt_templates['general']
+            )
+            
+            context_text = self._prepare_enhanced_context(context_chunks, query_context)
+            
+            prompt = template.format(
+                query=query,
+                context=context_text,
+                query_type=query_context.query_type,
+                tickers=', '.join(query_context.tickers) if query_context.tickers else 'N/A',
+                time_periods=', '.join(query_context.time_periods) if query_context.time_periods else 'N/A'
+            )
+            
+            # Check if OpenAI API key is available
+            if not openai.api_key:
+                logger.warning("OpenAI API key not set, using fallback response")
+                return self._generate_fallback_answer(query, context_chunks, query_context)
+            
+            # Actual OpenAI API call
+            response = openai.ChatCompletion.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a financial research analyst specializing in SEC filings analysis."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=2000,
+                temperature=0.1
+            )
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
             return self._generate_fallback_answer(query, context_chunks, query_context)
-        
-        # Actual OpenAI API call
-        response = openai.ChatCompletion.create(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": "You are a financial research analyst specializing in SEC filings analysis."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2000,
-            temperature=0.1
-        )
-        
-        return response.choices[0].message.content
-        
-    except Exception as e:
-        logger.error(f"OpenAI API error: {e}")
-        return self._generate_fallback_answer(query, context_chunks, query_context)
 
     def _generate_fallback_answer(self, query: str, context_chunks: List[Dict], 
                             query_context: QueryContext) -> str:
-    """Generate fallback answer when OpenAI is not available"""
-    if not context_chunks:
-        return "I couldn't find relevant information in the SEC filings to answer your question."
-    
-    # Extract key information from chunks
-    sources_info = []
-    for i, chunk in enumerate(context_chunks[:5], 1):
-        metadata = chunk['metadata']
-        sources_info.append(f"[Source {i}] {metadata.get('ticker', 'Unknown')} {metadata.get('filing_type', '')} ({metadata.get('filing_date', '')}) - {metadata.get('section', '')}")
-    
-    if query_context.query_type == 'comparative':
-        tickers = query_context.tickers
-        return f"""
+        """Generate fallback answer when OpenAI is not available"""
+        if not context_chunks:
+            return "I couldn't find relevant information in the SEC filings to answer your question."
+        
+        # Extract key information from chunks
+        sources_info = []
+        for i, chunk in enumerate(context_chunks[:5], 1):
+            metadata = chunk['metadata']
+            sources_info.append(f"[Source {i}] {metadata.get('ticker', 'Unknown')} {metadata.get('filing_type', '')} ({metadata.get('filing_date', '')}) - {metadata.get('section', '')}")
+        
+        if query_context.query_type == 'comparative':
+            tickers = query_context.tickers
+            return f"""
 ## Analysis Summary
 Based on SEC filings for {', '.join(tickers) if tickers else 'the requested companies'}, here are the key findings:
 
@@ -1601,8 +1598,19 @@ This is a basic response. For detailed analysis, please ensure OpenAI API key is
 ## Sources Referenced
 {len(context_chunks)} relevant document sections were analyzed.
 """
-    else:
-        return f"""
+        elif query_context.query_type == 'risk-analysis':
+            return f"""
+## Risk Summary
+Based on the available SEC filing data, I found relevant risk information across {len(context_chunks)} document sections.
+
+## Key Sources
+{chr(10).join(sources_info)}
+
+## Note
+This is a basic response. For detailed risk analysis with specific insights and categorization, please ensure OpenAI API key is configured.
+"""
+        else:
+            return f"""
 ## Answer Summary
 Based on the available SEC filing data, I found relevant information across {len(context_chunks)} document sections.
 
@@ -1611,36 +1619,6 @@ Based on the available SEC filing data, I found relevant information across {len
 
 ## Note
 This is a basic response. For detailed analysis with specific insights and comparisons, please ensure OpenAI API key is configured.
-"""
-        
-        elif query_context.query_type == 'risk-analysis':
-            return """
-## Risk Summary
-The company faces three primary risk categories: market, operational, and regulatory.
-
-## Risk Categories
-1. Market Risks (Competition, Demand Fluctuation) [Source 1]
-2. Operational Risks (Supply Chain, Cybersecurity) [Source 2]
-3. Regulatory Risks (Privacy Laws, Antitrust) [Source 3]
-
-## Risk Trends and Changes
-Supply chain risks have increased by 30% year-over-year...
-"""
-        
-        # Default answer for other query types
-        return f"""
-## Answer Summary
-Based on the analysis of SEC filings, the key findings are...
-
-## Detailed Explanation
-The documents reveal that... [Source 1, 3]. Specifically, the company reported... [Source 2].
-
-## Supporting Evidence
-- Metric 1: Value (Source)
-- Metric 2: Value (Source)
-
-## Limitations
-The analysis is limited to publicly available data through {datetime.now().year-1}.
 """
 
     def _extract_enhanced_sources(self, context_chunks: List[Dict]) -> List[Dict]:
@@ -1651,11 +1629,11 @@ The analysis is limited to publicly available data through {datetime.now().year-
             metadata = chunk['metadata']
             sources.append({
                 'source_id': i,
-                'ticker': metadata.ticker,
-                'company_name': metadata.company_name,
-                'filing_type': metadata.filing_type,
-                'filing_date': metadata.filing_date,
-                'section': metadata.section,
+                'ticker': metadata.get('ticker', 'N/A'),
+                'company_name': metadata.get('company_name', 'N/A'),
+                'filing_type': metadata.get('filing_type', 'N/A'),
+                'filing_date': metadata.get('filing_date', 'N/A'),
+                'section': metadata.get('section', 'N/A'),
                 'relevance_score': self._calculate_chunk_relevance(chunk),
                 'key_excerpts': self._extract_key_excerpts(chunk['text'])
             })
@@ -1668,12 +1646,12 @@ The analysis is limited to publicly available data through {datetime.now().year-
         score = 0.5  # Base score
         
         # Increase for financial sections
-        if chunk['metadata'].section in ['Financial Statements', 'MD&A']:
+        if chunk['metadata'].get('section') in ['Financial Statements', 'MD&A']:
             score += 0.2
             
         # Increase for recent filings
         try:
-            filing_date = datetime.strptime(chunk['metadata'].filing_date, '%Y-%m-%d')
+            filing_date = datetime.strptime(chunk['metadata'].get('filing_date', ''), '%Y-%m-%d')
             days_old = (datetime.now() - filing_date).days
             if days_old < 365:
                 score += 0.1
@@ -1850,7 +1828,6 @@ class SECQACompleteSystem:
         except Exception as e:
             logger.error(f"Error retrieving from vector database: {e}")
             return []
-
     
     def process_query(self, query: str) -> Dict[str, Any]:
         """Complete query processing pipeline"""
@@ -1917,93 +1894,141 @@ class SECQACompleteSystem:
             }
     
     def _retrieve_relevant_chunks(self, query: str, query_context: QueryContext) -> List[Dict]:
-    """Retrieve relevant document chunks for a query"""
-    try:
-        # First try to retrieve from vector database
-        chunks_from_db = self._retrieve_from_vector_db(query, n_results=100)
-        
-        if chunks_from_db:
-            # Filter by query context
-            filtered_chunks = self._filter_chunks_by_context_dict(chunks_from_db, query_context)
-            if filtered_chunks:
-                return filtered_chunks[:self.config['max_chunks']]
-        
-        # Fallback: fetch and process new documents
-        logger.info("No relevant chunks in database, fetching new documents...")
-        
-        filings = []
-        for ticker in query_context.tickers or ['AAPL']:  # Default to AAPL if no tickers
-            ticker_filings = self.data_fetcher.get_company_filings(
-                ticker,
-                filing_types=query_context.filing_types,
-                start_date=self._get_start_date(query_context.time_periods),
-                limit=5
-            )
-            filings.extend(ticker_filings)
-        
-        # Process filings to get chunks
-        all_chunks = []
-        for filing in filings[:5]:  # Limit to 5 filings
-            content = self.data_fetcher.download_filing_content(filing)
-            if content:
-                chunks = self.document_processor.process_filing(content, filing)
-                all_chunks.extend(chunks)
-        
-        if all_chunks:
-            # Add to vector database for future use
-            self._populate_vector_db(all_chunks)
+        """Retrieve relevant document chunks for a query"""
+        try:
+            # First try to retrieve from vector database
+            chunks_from_db = self._retrieve_from_vector_db(query, n_results=100)
             
-            # Filter and score chunks
-            filtered_chunks = self._filter_chunks_by_context(all_chunks, query_context)
+            if chunks_from_db:
+                # Filter by query context
+                filtered_chunks = self._filter_chunks_by_context_dict(chunks_from_db, query_context)
+                if filtered_chunks:
+                    return filtered_chunks[:self.config['max_chunks']]
             
-            # Convert to dict format and calculate similarity
-            query_embedding = self.embedding_model.encode(query)
-            scored_chunks = []
+            # Fallback: fetch and process new documents
+            logger.info("No relevant chunks in database, fetching new documents...")
             
-            for chunk_text, chunk_metadata in filtered_chunks:
-                chunk_embedding = self.embedding_model.encode(chunk_text)
-                similarity = cosine_similarity([query_embedding], [chunk_embedding])[0][0]
+            filings = []
+            for ticker in query_context.tickers or ['AAPL']:  # Default to AAPL if no tickers
+                ticker_filings = self.data_fetcher.get_company_filings(
+                    ticker,
+                    filing_types=query_context.filing_types,
+                    start_date=self._get_start_date(query_context.time_periods),
+                    limit=5
+                )
+                filings.extend(ticker_filings)
+            
+            # Process filings to get chunks
+            all_chunks = []
+            for filing in filings[:5]:  # Limit to 5 filings
+                content = self.data_fetcher.download_filing_content(filing)
+                if content:
+                    chunks = self.document_processor.process_filing(content, filing)
+                    all_chunks.extend(chunks)
+            
+            if all_chunks:
+                # Add to vector database for future use
+                self._populate_vector_db(all_chunks)
                 
-                scored_chunks.append({
-                    'text': chunk_text,
-                    'metadata': asdict(chunk_metadata),
-                    'similarity_score': similarity
-                })
+                # Filter and score chunks
+                filtered_chunks = self._filter_chunks_by_context(all_chunks, query_context)
+                
+                # Convert to dict format and calculate similarity
+                query_embedding = self.embedding_model.encode(query)
+                scored_chunks = []
+                
+                for chunk_text, chunk_metadata in filtered_chunks:
+                    chunk_embedding = self.embedding_model.encode(chunk_text)
+                    similarity = cosine_similarity([query_embedding], [chunk_embedding])[0][0]
+                    
+                    scored_chunks.append({
+                        'text': chunk_text,
+                        'metadata': asdict(chunk_metadata),
+                        'similarity_score': similarity
+                    })
+                
+                scored_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
+                return scored_chunks[:self.config['max_chunks']]
             
-            scored_chunks.sort(key=lambda x: x['similarity_score'], reverse=True)
-            return scored_chunks[:self.config['max_chunks']]
-        
-        return []
-        
-    except Exception as e:
-        logger.error(f"Error retrieving relevant chunks: {e}")
-        return []
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error retrieving relevant chunks: {e}")
+            return []
 
-def _filter_chunks_by_context_dict(self, chunks: List[Dict], query_context: QueryContext) -> List[Dict]:
-    """Filter chunks when they come from vector DB as dicts"""
-    filtered = []
-    
-    for chunk in chunks:
-        metadata = chunk['metadata']
+    def _filter_chunks_by_context_dict(self, chunks: List[Dict], query_context: QueryContext) -> List[Dict]:
+        """Filter chunks when they come from vector DB as dicts"""
+        filtered = []
         
-        # Filter by ticker
-        if query_context.tickers and metadata.get('ticker') not in query_context.tickers:
-            continue
+        for chunk in chunks:
+            metadata = chunk['metadata']
             
-        # Filter by filing type
-        if query_context.filing_types and metadata.get('filing_type') not in query_context.filing_types:
-            continue
-            
-        # Filter by time period
-        if query_context.time_periods and not self._matches_time_period(
-            metadata.get('filing_date', ''), query_context.time_periods
-        ):
-            continue
-            
-        filtered.append(chunk)
+            # Filter by ticker
+            if query_context.tickers and metadata.get('ticker') not in query_context.tickers:
+                continue
+                
+            # Filter by filing type
+            if query_context.filing_types and metadata.get('filing_type') not in query_context.filing_types:
+                continue
+                
+            # Filter by time period
+            if query_context.time_periods and not self._matches_time_period(
+                metadata.get('filing_date', ''), query_context.time_periods
+            ):
+                continue
+                
+            filtered.append(chunk)
+        
+        return filtered
+
+    def _filter_chunks_by_context(self, chunks: List[Tuple[str, DocumentMetadata]], query_context: QueryContext) -> List[Tuple[str, DocumentMetadata]]:
+        """Filter chunks when they come from processing as tuples"""
+        filtered = []
+        
+        for chunk_text, chunk_metadata in chunks:
+            # Filter by ticker
+            if query_context.tickers and chunk_metadata.ticker not in query_context.tickers:
+                continue
+                
+            # Filter by filing type
+            if query_context.filing_types and chunk_metadata.filing_type not in query_context.filing_types:
+                continue
+                
+            # Filter by time period
+            if query_context.time_periods and not self._matches_time_period(
+                chunk_metadata.filing_date, query_context.time_periods
+            ):
+                continue
+                
+            filtered.append((chunk_text, chunk_metadata))
+        
+        return filtered
     
-    return filtered
-    
+    def _get_start_date(self, time_periods: List[str]) -> Optional[str]:
+        """Convert time periods to start date for filtering"""
+        if not time_periods:
+            return None
+            
+        # Find earliest year from time periods
+        years = []
+        for period in time_periods:
+            if period.isdigit() and len(period) == 4:
+                years.append(int(period))
+            elif '-' in period:
+                try:
+                    start_year = int(period.split('-')[0])
+                    years.append(start_year)
+                except:
+                    continue
+            elif period == 'recent':
+                years.append(datetime.now().year - 2)
+            elif period == 'last_year':
+                years.append(datetime.now().year - 1)
+        
+        if years:
+            return f"{min(years)}-01-01"
+        return None
+        
     def _matches_time_period(self, filing_date: str, time_periods: List[str]) -> bool:
         """Check if filing date matches any time period"""
         if not time_periods:
@@ -2109,5 +2134,5 @@ if __name__ == "__main__":
         for i, source in enumerate(sources[:3], 1):
             print(f"{i}. {source.get('ticker', 'N/A')} {source.get('filing_type', 'N/A')} ({source.get('filing_date', 'N/A')})")
     
-    print(f"\nProcessing Time: {result.get('total_time', 'N/A')} seconds")
+    print(f"\nProcessing Time: {result.get('performance_metrics', {}).get('total_time', 'N/A')} seconds")
     print("="*80)
